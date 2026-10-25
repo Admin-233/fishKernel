@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+# 存档里的运行时数据不进仓库
+archives/*/Runtime/
+archives/*/basic.instance
+# 部署产物
+*.tar.gz
