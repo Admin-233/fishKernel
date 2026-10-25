@@ -4,9 +4,10 @@
 
 | 层 | 位置 | 是否联网 | 说明 |
 |---|---|---|---|
-| 单元 / 集成 | `tests/` | 否 | 事件、投影、压缩、任务、控制、工具、mock 循环，共 67 项 |
+| 单元 / 集成 | `tests/` | 否 | 事件、投影、压缩、任务、控制、工具、TUI、mock 循环，共 93 项 |
 | 真实 API 冒烟 | `scripts/smoke_real.sh` | 是 | 限 2 轮，只读操作，验证 openai SDK + 工具调用 |
 | 工具链路冒烟 | `scripts/smoke_tools.sh` | 是 | 限 3 轮，验证 spawn → wait_job → job_output |
+| TUI 冒烟 | `scripts/smoke_tui.sh` | 否 | 渲染快照 + 在伪终端里启动一次真实 TUI |
 
 安全约定：由于内核给模型全部权限，**真实模型相关测试只在隔离测试机上跑**。纯单元测试不执行模型、不联网，可以在任意环境跑，但仍建议统一在测试机上执行，避免环境差异。
 
@@ -62,6 +63,14 @@ ssh <test-host> 'FISHKERNEL_KEY=sk-... bash ~/fishKernel/scripts/smoke_tools.sh'
 ```
 
 它会跑 3 轮：`spawn("echo fishkernel-ok")` → 内核通知任务完成 → `wait_job` → `job_output`，最后检查 `Runtime/jobs` 里出现 `fishkernel-ok`。
+
+## TUI 冒烟
+
+```bash
+bash scripts/smoke_tui.sh
+```
+
+先生成一份 mock 存档并跑 3 轮，再用 `--snapshot` 渲染一帧（肉眼检查布局），最后用 `script` 分配伪终端、真实启动 TUI 3 秒，确认能进入界面且不崩。
 
 ## 加测试
 

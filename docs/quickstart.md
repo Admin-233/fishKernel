@@ -80,7 +80,13 @@ fishkernel run ./archives/demo --max-turns 5
 
 ## 6. 观察
 
-另开一个终端：
+最直观的方式是 TUI（实时事件流 + 输入框）：
+
+```bash
+fishkernel tui ./archives/demo
+```
+
+不想进界面就看文件：
 
 ```bash
 fishkernel status ./archives/demo --tail 20 --jobs

@@ -23,6 +23,7 @@
 | 上下文压缩 | 阈值按模型窗口与输出预留推导；按消息边界选区；分块摘要；事务化提交 |
 | token 计量 | 以 API 返回的 `usage` 为锚点，只对新增内容估算，并用实测比例校准 |
 | 控制通道 | 暂停/恢复/停止/调延时/注入消息，全部通过存档内文件，任意进程或远程 shell 都能操作 |
+| 终端界面 | `fishkernel tui`：上半屏实时事件流、下半屏输入框，分类着色，长工具调用自动压缩 |
 | 崩溃恢复 | 未闭合的压缩事务、孤儿工具调用、孤儿进程都有明确处理路径 |
 | 可插拔工具 | `Tools/` 目录登记命令行工具用法，模型通过 `spawn` 调用 |
 
@@ -49,6 +50,7 @@ fishkernel run ./archives/demo
 
 ```bash
 fishkernel status ./archives/demo --tail 20 --jobs
+fishkernel tui ./archives/demo             # 实时观察 + 直接对话
 fishkernel say ./archives/demo "去 Tools 目录看看有什么可用的"
 fishkernel ctl ./archives/demo pause        # 暂停（不消耗 API）
 fishkernel ctl ./archives/demo resume
@@ -167,6 +169,7 @@ effort = high            # 可选：low / high / max，由服务端处理
 ```text
 fishkernel new   <目录> [--name ...] [--model ...] [--api-key ...] [--max-tokens ...] [--turn-delay ...]
 fishkernel run   <目录> [--max-turns N] [--once] [--mock] [--quiet]
+fishkernel tui   <目录> [--plain] [--snapshot] [--no-color] [--width N] [--height N] [--refresh 秒]
 fishkernel ctl   <目录> pause|resume|stop|delay [秒数]
 fishkernel say   <目录> <文本...>
 fishkernel status <目录> [--tail N] [--jobs]
@@ -202,7 +205,7 @@ fishkernel status <目录> [--tail N] [--jobs]
 ## 测试
 
 ```bash
-# 单测（67 项，不联网）
+# 单测（93 项，不联网）
 python -m pytest -q
 
 # 推送隔离测试机 → 建 venv → 安装 → 跑全部测试
@@ -223,7 +226,7 @@ python scripts/deploy.py --real-api
 ```
 fishKernel/
 ├── src/fishkernel/        # 内核源码
-├── tests/                 # pytest（67 项）
+├── tests/                 # pytest（93 项）
 ├── scripts/               # 部署与联调脚本
 ├── docs/                  # 使用文档
 ├── ARCHITECTURE.md        # 实现规范（协议、事务、恢复）
@@ -241,10 +244,12 @@ fishKernel/
 6. 只在 Linux/arm64 上验证过；Windows 分支（`taskkill` 杀进程组）未测。
 7. 桌面 GUI / 网页控制台未实现（控制面已全部落在文件上，接 UI 不需要改内核）。
 8. 压缩只保证“更短”，不保证摘要信息不丢；摘要质量未评测。
+9. TUI 只读事件流，不支持鼠标/搜索；长事件只显示摘要，完整内容看 `events.jsonl`。
 
 ## 文档
 
 - [docs/quickstart.md](docs/quickstart.md) — 从零跑起第一个 Agent
+- [docs/tui.md](docs/tui.md) — 终端界面：布局、颜色、按键、命令
 - [docs/tools.md](docs/tools.md) — 工具协议与自定义工具
 - [docs/operations.md](docs/operations.md) — 运行、监控、恢复、清理
 - [docs/testing.md](docs/testing.md) — 测试与部署

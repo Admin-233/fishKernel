@@ -32,6 +32,14 @@ fishkernel status <目录> [--tail N] [--jobs]
 
 ## 观察
 
+最直观的方式是 TUI：
+
+```bash
+fishkernel tui ./archives/demo
+```
+
+上半屏实时事件流、下半屏输入框，见 [tui.md](tui.md)。不想进界面时用文件：
+
 | 位置 | 内容 |
 |---|---|
 | `Runtime/kernel.log` | 每轮压力、token 实测/估算、工具结果、错误栈 |

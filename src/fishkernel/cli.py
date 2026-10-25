@@ -1,9 +1,10 @@
-"""命令行：new / run / ctl / say / status。"""
+"""命令行：new / run / ctl / say / status / tui。"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -53,6 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--tail", type=int, default=15)
     p_status.add_argument("--jobs", action="store_true", help="列出异步任务")
 
+    p_tui = sub.add_parser("tui", help="实时观察并对话的终端界面")
+    p_tui.add_argument("directory")
+    p_tui.add_argument("--plain", action="store_true", help="不进入备用屏，按行输出")
+    p_tui.add_argument("--snapshot", action="store_true", help="渲染一帧后退出（调试/截图）")
+    p_tui.add_argument("--no-color", action="store_true", help="关闭颜色")
+    p_tui.add_argument("--width", type=int, default=None, help="固定宽度（默认取终端）")
+    p_tui.add_argument("--height", type=int, default=None, help="固定高度（默认取终端）")
+    p_tui.add_argument("--refresh", type=float, default=0.2, help="刷新间隔秒（默认 0.2）")
+
     return parser
 
 
@@ -70,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_say(args)
         if args.command == "status":
             return _cmd_status(args)
+        if args.command == "tui":
+            return _cmd_tui(args)
     except (ArchiveError, ConfigError, ValueError, FileNotFoundError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
@@ -180,6 +192,21 @@ def _cmd_status(args: argparse.Namespace) -> int:
             line = event.type + " " + json.dumps(event.data, ensure_ascii=False)[:160]
         print(f"  #{event.seq} {line}")
     return 0
+
+
+def _cmd_tui(args: argparse.Namespace) -> int:
+    from .tui import run_tui
+
+    color = not args.no_color and os.environ.get("NO_COLOR") is None
+    return run_tui(
+        args.directory,
+        plain=args.plain,
+        snapshot=args.snapshot,
+        color=color,
+        width=args.width,
+        height=args.height,
+        refresh=args.refresh,
+    )
 
 
 def _usage_totals(events) -> tuple[int, int, int, int | None]:

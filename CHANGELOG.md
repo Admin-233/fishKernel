@@ -1,5 +1,13 @@
 # 更新日志
 
+## v0.2.0
+
+- 新增 `fishkernel tui`：实时事件流（上半屏）+ 输入框（下半屏），分类着色，长工具调用压缩显示。
+- 支持滚动回看、输入历史、`:pause/:resume/:stop/:delay` 命令；只读事件日志、只写控制文件。
+- 非交互模式：`--snapshot` 渲染一帧、`--plain` 按行输出；非终端环境自动退化。
+- 零新增依赖：POSIX 用 termios/select，Windows 用 msvcrt + VT。
+- 新增 `scripts/smoke_tui.sh`（快照 + 伪终端冒烟）。
+
 ## v0.1.1
 
 - token 计量改为「API 实测锚点 + 增量估算 + 比例校准」：以响应的 `usage.prompt_tokens` 为准，只估算新增内容。
