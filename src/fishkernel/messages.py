@@ -137,14 +137,20 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
     return head + _merge_runtime_user_messages(tail)
 
 
+def _is_runtime(content: object) -> bool:
+    return isinstance(content, str) and content.startswith(RUNTIME_PREFIX)
+
+
 def _merge_runtime_user_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """只合并双方都是 [runtime] 通知的连续 user 消息，绝不吞掉真实用户发言。"""
     merged: list[dict[str, Any]] = []
     for message in messages:
         if (
             merged
             and message["role"] == "user"
             and merged[-1]["role"] == "user"
-            and isinstance(merged[-1].get("content"), str)
+            and _is_runtime(message.get("content"))
+            and _is_runtime(merged[-1].get("content"))
         ):
             merged[-1]["content"] = merged[-1]["content"] + "\n" + str(message.get("content", ""))
         else:

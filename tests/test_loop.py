@@ -84,7 +84,9 @@ def test_user_message_from_inbox(archive):
     kernel.run()
     events = read_events(archive.events_path)
     users = [event for event in events if event.type == "user/message"]
-    assert users and users[0].data["text"] == "记得写测试"
+    assert users[0].data["text"] == "你开始运行了，欢迎"
+    assert users[0].data["source"] == "init"
+    assert any(event.data["text"] == "记得写测试" and event.data.get("source") == "control" for event in users)
 
 
 def test_tool_call_limit(archive):
@@ -100,3 +102,41 @@ def test_tool_call_limit(archive):
     rejected = [event for event in results if not event.data["ok"]]
     assert len(rejected) == 4
     assert "TOOL_CALL_LIMIT" in rejected[0].data["output"]
+
+
+def test_welcome_message_written_once(archive):
+    for _ in range(2):
+        Kernel(
+            archive.root,
+            client=ScriptedClient([Completion(text="ok")]),
+            max_turns=1,
+            echo=False,
+            error_backoff_base=0,
+        ).run()
+    init_users = [
+        event
+        for event in read_events(archive.events_path)
+        if event.type == "user/message" and event.data.get("source") == "init"
+    ]
+    assert len(init_users) == 1
+
+
+def test_delay_event_appended(tmp_path):
+    from fishkernel.archive import create_archive
+
+    archive = create_archive(tmp_path / "delay", name="delay", api_key="sk-test", turn_delay=0.05)
+    Kernel(
+        archive.root,
+        client=ScriptedClient([Completion(text="ok")]),
+        max_turns=1,
+        echo=False,
+        error_backoff_base=0,
+    ).run()
+    delays = [event for event in read_events(archive.events_path) if event.type == "delay"]
+    assert delays and delays[0].data["seconds"] > 0
+
+
+def test_no_delay_event_when_no_sleep(archive):
+    make_kernel(archive, [Completion(text="ok")]).run()
+    delays = [event for event in read_events(archive.events_path) if event.type == "delay"]
+    assert delays == []

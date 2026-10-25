@@ -60,16 +60,18 @@ def test_summary_base_and_after():
     assert messages[2]["content"] == "新消息"
 
 
-def test_runtime_messages_merged():
+def test_runtime_messages_merged_but_user_kept():
     events = [
         ev(1, "user/message", text="开始"),
         ev(2, "system/message", text="任务结束", kind="job"),
         ev(3, "system/message", text="任务结束2", kind="job"),
     ]
     messages = build_messages(events, "s")
-    assert len(messages) == 2
-    assert "[runtime]" in messages[1]["content"]
-    assert "任务结束2" in messages[1]["content"]
+    assert len(messages) == 3
+    assert messages[1]["content"] == "开始"
+    assert messages[2]["content"].startswith("[runtime]")
+    assert "任务结束" in messages[2]["content"]
+    assert "任务结束2" in messages[2]["content"]
 
 
 def test_conversation_units_keep_tool_pairs():

@@ -104,6 +104,8 @@ class OpenAIClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if self.config.effort:
+            payload["reasoning_effort"] = self.config.effort
 
         last_error: Exception | None = None
         for attempt in range(LLM_RETRIES):
@@ -159,13 +161,20 @@ def _parse_completion(response: Any, model: str) -> Completion:
     message = getattr(choice, "message", None)
     if message is None:
         raise LLMError("API 返回缺少 message", code="EMPTY_RESPONSE")
-    text = getattr(message, "content", None) or ""
-    reasoning = ""
+    raw_text = getattr(message, "content", None)
+    if raw_text is None:
+        text = ""
+    elif isinstance(raw_text, str):
+        text = raw_text
+    else:
+        text = str(raw_text)
+    raw_reasoning = None
     for attr in ("reasoning_content", "reasoning"):
         value = getattr(message, attr, None)
-        if isinstance(value, str) and value:
-            reasoning = value
+        if value:
+            raw_reasoning = value
             break
+    reasoning = raw_reasoning if isinstance(raw_reasoning, str) else (str(raw_reasoning) if raw_reasoning else "")
     raw_calls = getattr(message, "tool_calls", None) or []
     tool_calls: list[ToolCall] = []
     for raw in raw_calls:

@@ -4,7 +4,7 @@
 
 | 层 | 位置 | 是否联网 | 说明 |
 |---|---|---|---|
-| 单元 / 集成 | `tests/` | 否 | 事件、投影、压缩、任务、控制、工具、TUI、mock 循环，共 93 项 |
+| 单元 / 集成 | `tests/` | 否 | 事件、投影、压缩、任务、控制、工具、锁、TUI、mock 循环，共 111 项 |
 | 真实 API 冒烟 | `scripts/smoke_real.sh` | 是 | 限 2 轮，只读操作，验证 openai SDK + 工具调用 |
 | 工具链路冒烟 | `scripts/smoke_tools.sh` | 是 | 限 3 轮，验证 spawn → wait_job → job_output |
 | TUI 冒烟 | `scripts/smoke_tui.sh` | 否 | 渲染快照 + 在伪终端里启动一次真实 TUI |
@@ -71,6 +71,15 @@ bash scripts/smoke_tui.sh
 ```
 
 先生成一份 mock 存档并跑 3 轮，再用 `--snapshot` 渲染一帧（肉眼检查布局），最后用 `script` 分配伪终端、真实启动 TUI 3 秒，确认能进入界面且不崩。
+
+## 交班冒烟
+
+```bash
+bash scripts/smoke_handover.sh
+```
+
+启动一个 mock 内核 → `ctl restart` 触发交班 → 检查 `events.jsonl` 里出现
+`session/handover → session/end(restart) → session/start(新 pid)`，并校验 seq 严格连续。
 
 ## 加测试
 

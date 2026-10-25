@@ -21,8 +21,9 @@ fishKernel 用 OpenAI 的 function calling（`tools` 参数）。模型返回 `t
 
 - 相对路径相对于存档根目录，也接受绝对路径。
 - 单次最多 2000 行、256 KiB；超出时返回 `has_more: true` 和 `next_offset`，让模型自己分段。
+- 超过 256 KiB 时，**剩余内容会写进 `Runtime/spill/`**，payload 多一个顶层 `spill` 对象（`locator` / `hint` / `file_bytes` / `remainder_bytes`），不会再出现"只提示、不给内容"。
 - 二进制文件（前 8 KiB 含 `\0`）直接报 `binary_file`。
-- 单行过长会截断并提示改用 `spawn` + `head/awk`。
+- 单行过长会截断并把剩余部分写入 spill。
 
 ### list_dir
 
@@ -71,9 +72,21 @@ fishKernel 用 OpenAI 的 function calling（`tools` 参数）。模型返回 `t
 
 ## 长输出与溢出
 
-工具结果超过 32 KiB 字符时，完整内容写到 `Runtime/spill/<时间>-<名字>.txt`，模型只看到首尾预览、字节数和路径，再用 `read_file(path, offset, limit)` 取回。
+工具结果有一个硬约束：**永远是合法 JSON**。超过 32 KiB 字符时不会切字符串，而是：
+
+1. 递归遍历 payload，把超过 8000 字符的**字符串字段**替换成溢出指针对象：
+
+   ```json
+   {"locator": "Runtime/spill/20261025-...txt", "bytes": 123456,
+    "preview": "首尾预览…", "hint": "用 read_file(path=该文件) 分段读取"}
+   ```
+
+2. 如果字段都剪短后仍然超限，整份结果写入 spill，返回一个极简对象：
+   `{"ok": true, "truncated": true, "spill": {...}}`。
 
 任务输出不主动溢出（它本来就按块读取，`job_output` 每次最多 32 KiB）。
+
+`Runtime/spill/` 会在内核启动时自动清理：保留最近 200 个文件且总量不超过 50 MB。
 
 ## 注册命令行工具
 
@@ -115,6 +128,7 @@ Tools/
 | `invalid_job` / `not_found` | job id 非法或不存在 |
 | `TOOL_OUTCOME_UNKNOWN` | 历史里缺少该调用的结果（通常是崩溃残留） |
 | `TOOL_CALL_LIMIT` | 单轮工具调用超过 16 个，多出的被拒绝 |
+| `self_guard` | 命令或目标 pid 会终止内核自身/父进程/同进程组，被拒绝 |
 
 ## 写工具/提示词的注意事项
 
@@ -123,3 +137,4 @@ Tools/
 - 给长任务设 `timeout_seconds`，否则只能人工 `job_kill`。
 - 输出尽量结构化（JSON、固定前缀），方便模型解析。
 - 不要假设模型会读完整份大文件——提醒它用 `offset/limit`。
+- `selfguard` 只阻止"杀内核自己"这一类命令，不限制删除文件、改系统配置等其它破坏性操作。

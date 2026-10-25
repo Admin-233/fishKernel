@@ -1,5 +1,19 @@
 # 更新日志
 
+## v0.3.0
+
+- 修复工具返回值超长时被切成非法 JSON：改为把超长字符串字段换成溢出指针，任何情况下都返回合法 JSON。
+- 修复超长末行导致重启后 seq 回退：`_last_seq` 改为反向分块扫描（最多 64 MB）。
+- `read_file` 超过 256 KiB 时把剩余内容写入 `Runtime/spill/`，不再只给一句提示。
+- 新增单实例锁 `Runtime/kernel.lock`（POSIX `flock` / Windows `msvcrt.locking`），第二个内核会报 `LockError`。
+- 新增交班重启：`ctl restart` / TUI `:restart`，旧进程启动新进程、释放锁后正常退出。
+- 新增唤醒：`ctl wake` / TUI `:wake`，可打断 `sleep` 与 `wait_job`。
+- 新增 `selfguard`：拒绝终止内核自身、父进程或同进程组的命令。
+- 修复真实用户消息被并进运行时通知；修复 `reasoning=None` 导致整轮丢失。
+- 新增 `delay` 事件、启动时清理 spill、`effort` 配置真正下发给 API。
+- 首次启动补欢迎语（`source=init`，只写一次）。
+- TUI：非终端环境改为持续跟随输出；放宽单类消息的行数上限；新增 `:wake` / `:restart`。
+
 ## v0.2.0
 
 - 新增 `fishkernel tui`：实时事件流（上半屏）+ 输入框（下半屏），分类着色，长工具调用压缩显示。

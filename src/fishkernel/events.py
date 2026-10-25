@@ -15,6 +15,9 @@ from typing import Any, Iterator
 
 from .atomic import append_line
 
+_SCAN_CHUNK = 64 * 1024
+_SCAN_MAX_BYTES = 64 * 1024 * 1024
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
@@ -116,21 +119,43 @@ class EventLog:
 
 
 def _last_seq(path: Path) -> int:
+    """反向分块扫描，找到最后一条可解析的完整事件。
+
+    不能只读末尾 64 KiB：如果最后一行本身就超过窗口，会一条都解析不出来然后返回 0，
+    导致重启后从 seq=1 重写、与历史重复。
+    """
     size = path.stat().st_size
     if size == 0:
         return 0
+    tail = b""
+    scanned = 0
     with open(path, "rb") as handle:
-        # 读末尾最多 64 KiB，取最后一行
-        start = max(0, size - 65536)
-        handle.seek(start)
-        tail = handle.read().decode("utf-8", errors="replace")
-    for line in reversed(tail.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        event = Event.from_json(line)
-        if event is not None:
-            return event.seq
+        position = size
+        while position > 0 and scanned < _SCAN_MAX_BYTES:
+            step = min(_SCAN_CHUNK, position)
+            position -= step
+            handle.seek(position)
+            chunk = handle.read(step)
+            scanned += step
+            buffer = chunk + tail
+            lines = buffer.split(b"\n")
+            if position > 0:
+                tail = lines[0]  # 跨块的半行，留给下一轮
+                complete = lines[1:]
+            else:
+                tail = b""
+                complete = lines
+            for line in reversed(complete):
+                line = line.strip()
+                if not line:
+                    continue
+                event = Event.from_json(line.decode("utf-8", errors="replace"))
+                if event is not None:
+                    return event.seq
+        if tail.strip():
+            event = Event.from_json(tail.strip().decode("utf-8", errors="replace"))
+            if event is not None:
+                return event.seq
     return 0
 
 

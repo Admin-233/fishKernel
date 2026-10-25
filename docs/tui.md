@@ -70,7 +70,7 @@ Enter 发送 · :pause :resume :stop :delay N · PgUp/PgDn 滚动 · Ctrl-C 退�
 | `Ctrl-U` | 清空输入 |
 | `Ctrl-W` | 删除一个词 |
 | `Ctrl-C` | 退出 TUI（**不会**停止内核） |
-| `Esc` | 清空输入 |
+| `Esc` | 输入框有内容时清空；为空时请求唤醒内核 |
 
 ## 命令
 
@@ -81,6 +81,8 @@ Enter 发送 · :pause :resume :stop :delay N · PgUp/PgDn 滚动 · Ctrl-C 退�
 | `:pause` | 暂停内核（不再调用 API，但进程还在） |
 | `:resume` | 恢复 |
 | `:stop` | 让内核收尾退出 |
+| `:wake` / `:w` | 让正在 `sleep` / `wait_job` 的内核提前醒来 |
+| `:restart` / `:reload` | 交班重启：新进程接管，旧进程正常退出 |
 | `:delay N` | 把每轮延时改成 N 秒 |
 | `:help` | 在事件流里显示帮助 |
 | `:quit` | 退出 TUI |
@@ -97,7 +99,7 @@ Enter 发送 · :pause :resume :stop :delay N · PgUp/PgDn 滚动 · Ctrl-C 退�
   - `job_output` → 读了多少字符、是否 EOF
   - `wait_job` → 任务状态与退出码
   - 失败 → 错误码 + 原因
-- 模型回复最多显示 14 行、系统通知最多 4 行、错误最多 6 行，超出显示 `…（还有 N 行）`。
+- 模型回复最多显示 400 行、用户消息 200 行、系统通知 100 行、错误 60 行，超出显示 `…（还有 N 行）`。
 - "没有工具调用，内核唤醒你"这类空转提醒不显示（事件日志里仍有）。
 - 完整内容永远可以从 `Runtime/events.jsonl` 查。
 
@@ -119,7 +121,13 @@ fishkernel tui ./archives/demo --plain
 | `--refresh 0.2` | 刷新间隔（秒） |
 | `--no-color` | 关闭颜色 |
 
-当 stdout 不是终端（比如重定向到文件）时，会自动退化为 `--plain`。
+当 stdout 不是终端（比如重定向到文件）时，会自动进入**跟随模式**：持续把新事件按行打印出来，直到进程被停止（Ctrl-C / SIGTERM）。适合 `nohup`、管道和 CI：
+
+```bash
+fishkernel tui ./archives/demo --no-color > feed.log &   # 后台跟随
+```
+
+`--plain` 与跟随模式的区别：`--plain` 会把 stdin 当作逐行输入源，stdin 关闭就退出；跟随模式不读 stdin，只输出。
 
 ## 工作原理
 

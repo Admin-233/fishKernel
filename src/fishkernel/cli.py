@@ -16,6 +16,7 @@ from .control import Control
 from .events import read_events
 from .jobs import JobManager
 from .llm import ScriptedClient
+from .lock import LockError
 from .loop import Kernel
 
 
@@ -42,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ctl = sub.add_parser("ctl", help="控制运行状态")
     p_ctl.add_argument("directory")
-    p_ctl.add_argument("action", choices=["pause", "resume", "stop", "delay"])
+    p_ctl.add_argument("action", choices=["pause", "resume", "stop", "delay", "wake", "restart"])
     p_ctl.add_argument("value", nargs="?", type=float, default=None, help="delay 的秒数")
 
     p_say = sub.add_parser("say", help="给 Agent 发一条用户消息")
@@ -82,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_status(args)
         if args.command == "tui":
             return _cmd_tui(args)
-    except (ArchiveError, ConfigError, ValueError, FileNotFoundError) as exc:
+    except (ArchiveError, ConfigError, ValueError, FileNotFoundError, LockError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     parser.error("未知命令")
@@ -114,7 +115,11 @@ def _cmd_new(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    client = ScriptedClient(default_text="（mock）我收到了一条消息。") if args.mock else None
+    mock = args.mock or os.environ.get("FISHKERNEL_MOCK") == "1"
+    if args.mock:
+        # 让交班接班进程也保持在 mock 模式（子进程继承环境变量）
+        os.environ["FISHKERNEL_MOCK"] = "1"
+    client = ScriptedClient(default_text="（mock）我收到了一条消息。") if mock else None
     kernel = Kernel(
         args.directory,
         client=client,
@@ -133,6 +138,14 @@ def _cmd_ctl(args: argparse.Namespace) -> int:
         state = control.write_state(run="run")
     elif args.action == "stop":
         state = control.write_state(run="stop")
+    elif args.action == "wake":
+        control.request_wake()
+        print("已请求唤醒。")
+        return 0
+    elif args.action == "restart":
+        control.request_restart("cli")
+        print("已请求交班重启，内核会在下一轮启动新进程并退出。")
+        return 0
     else:  # delay
         if args.value is None:
             print(f"当前每轮延时：{control.read_state().get('delay')} 秒（未设置则用配置默认值）")

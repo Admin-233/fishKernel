@@ -100,16 +100,59 @@ class Control:
         with open(path, "a", encoding="utf-8", newline="") as handle:
             handle.write(line + "\n")
 
+    # ---- 唤醒 / 重启请求 ----
+    def request_wake(self) -> None:
+        write_atomic(self.archive.wake_path, time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+
+    def consume_wake(self) -> bool:
+        """存在唤醒请求就消费掉（只生效一次）。"""
+        try:
+            self.archive.wake_path.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        return True
+
+    def request_restart(self, reason: str = "manual") -> None:
+        write_atomic(
+            self.archive.restart_path,
+            json.dumps({"reason": reason, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, ensure_ascii=False),
+        )
+
+    def consume_restart(self) -> dict[str, object] | None:
+        path = self.archive.restart_path
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = {}
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return payload if isinstance(payload, dict) else {}
+
     # ---- 可中断等待 ----
     def interruptible_sleep(self, seconds: float) -> tuple[float, str]:
-        """睡到时间用尽，或被 pause/stop 打断。
+        """睡到时间用尽，或被 pause / stop / wake 打断。
 
-        返回 (实际睡了多久, 原因)，原因 ∈ {"elapsed", "pause", "stop"}。
+        返回 (实际睡了多久, 原因)，原因 ∈ {"elapsed", "pause", "stop", "wake"}。
         """
         if seconds <= 0:
             state = self.read_state()
-            reason = "stop" if state["run"] == "stop" else ("pause" if state["run"] == "pause" else "elapsed")
-            return 0.0, reason
+            if state["run"] == "stop":
+                return 0.0, "stop"
+            if state["run"] == "pause":
+                return 0.0, "pause"
+            if self.consume_wake():
+                return 0.0, "wake"
+            return 0.0, "elapsed"
         deadline = time.monotonic() + seconds
         slept = 0.0
         while True:
@@ -118,6 +161,8 @@ class Control:
                 return slept, "stop"
             if state["run"] == "pause":
                 return slept, "pause"
+            if self.consume_wake():
+                return slept, "wake"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return slept, "elapsed"

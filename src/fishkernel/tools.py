@@ -25,7 +25,10 @@ from .constants import (
 )
 from .control import Control
 from .jobs import JobManager
+from .selfguard import check_pid, check_signal_command
 from .spill import preview, save_text
+
+_SPILL_REMAINDER_LIMIT = 16 * 1024 * 1024
 
 TOOL_SPECS: list[dict[str, Any]] = [
     {
@@ -170,14 +173,55 @@ class ToolResult:
     duration_ms: int = 0
     name: str = ""
     call_id: str = ""
+    spill_dir: Path | None = None
 
     @property
     def text(self) -> str:
+        """永远返回合法 JSON；超长时把字符串字段换成溢出指针，而不是切断 JSON。"""
         rendered = json.dumps(self.payload, ensure_ascii=False, separators=(",", ":"))
         if len(rendered) <= MAX_INLINE_RESULT_CHARS:
             return rendered
-        # 兜底：极端大的结果也走溢出
-        return rendered[:MAX_INLINE_RESULT_CHARS] + "...[结果过长已截断]"
+        shrunk = _shrink(self.payload, self.spill_dir, f"result-{self.name or 'tool'}")
+        rendered = json.dumps(shrunk, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) <= MAX_INLINE_RESULT_CHARS:
+            return rendered
+        # 剪枝后仍然过大：整份落盘，只回一个极小但合法的对象
+        if self.spill_dir is not None:
+            info = save_text(self.spill_dir, rendered, f"result-{self.name or 'tool'}")
+            minimal: dict[str, Any] = {"ok": self.ok, "truncated": True, "spill": info}
+        else:
+            minimal = {"ok": self.ok, "truncated": True, "bytes": len(rendered)}
+        return json.dumps(minimal, ensure_ascii=False, separators=(",", ":"))
+
+
+_INLINE_STRING_LIMIT = 8_000
+_RESULT_PREVIEW_CHARS = 1_200
+
+
+def _pointer(text: str, spill_dir: Path | None, name: str) -> dict[str, Any]:
+    body, _ = preview(text, limit_chars=_RESULT_PREVIEW_CHARS)
+    if spill_dir is None:
+        return {"truncated": True, "bytes": len(text.encode("utf-8")), "preview": body}
+    info = save_text(spill_dir, text, name)
+    return {
+        "locator": info["locator"],
+        "bytes": info["bytes"],
+        "preview": body,
+        "hint": info["hint"],
+    }
+
+
+def _shrink(value: Any, spill_dir: Path | None, name: str) -> Any:
+    """递归把过长的字符串字段换成溢出指针；结构本身保持合法 JSON。"""
+    if isinstance(value, str):
+        if len(value) <= _INLINE_STRING_LIMIT:
+            return value
+        return _pointer(value, spill_dir, name)
+    if isinstance(value, list):
+        return [_shrink(item, spill_dir, name) for item in value]
+    if isinstance(value, dict):
+        return {key: _shrink(item, spill_dir, name) for key, item in value.items()}
+    return value
 
 
 class ToolBox:
@@ -199,7 +243,7 @@ class ToolBox:
             if handler is None:
                 raise _ToolError("unknown_tool", f"没有名为 {name} 的工具")
             payload = handler(args)
-            result = ToolResult(ok=True, payload=payload, name=name, call_id=call_id)
+            result = ToolResult(ok=True, payload=payload, name=name, call_id=call_id, spill_dir=self.archive.spill_dir)
             if isinstance(payload.get("job_id"), str):
                 result.job_id = payload["job_id"]
         except _ToolError as exc:
@@ -208,6 +252,7 @@ class ToolBox:
                 payload={"ok": False, "error": {"code": exc.code, "message": exc.message}},
                 name=name,
                 call_id=call_id,
+                spill_dir=self.archive.spill_dir,
             )
         except Exception as exc:  # noqa: BLE001 - 工具错误必须成为模型可读的返回值
             result = ToolResult(
@@ -215,6 +260,7 @@ class ToolBox:
                 payload={"ok": False, "error": {"code": "tool_crash", "message": f"{type(exc).__name__}: {exc}"}},
                 name=name,
                 call_id=call_id,
+                spill_dir=self.archive.spill_dir,
             )
         result.duration_ms = int((time.monotonic() - started) * 1000)
         return result
@@ -241,10 +287,41 @@ class ToolBox:
             path = self.archive.root / path
         return path.resolve()
 
-    def _spill_payload(self, text: str, name: str) -> dict[str, Any]:
-        info = save_text(self.archive.spill_dir, text, name)
-        body, truncated = preview(text)
-        return {"data": body, "truncated": True, "spill": info}
+    def _spill_remainder(self, path: Path, position: int) -> dict[str, Any]:
+        """把文件从 position 起的剩余内容写入 spill，返回定位信息。"""
+        try:
+            total = path.stat().st_size
+        except OSError as exc:
+            return {"error": str(exc)}
+        remaining = max(0, total - position)
+        spill_dir = self.archive.spill_dir
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        dest = spill_dir / f"read-{int(time.time())}-{os.getpid()}-{position}.txt"
+        limit = min(remaining, _SPILL_REMAINDER_LIMIT)
+        copied = 0
+        try:
+            with open(path, "rb") as source, open(dest, "wb") as target:
+                source.seek(position)
+                while copied < limit:
+                    chunk = source.read(min(65_536, limit - copied))
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    copied += len(chunk)
+        except OSError as exc:
+            return {"error": str(exc), "file_bytes": total, "remainder_bytes": remaining}
+        hint = f"从第 {position} 字节起的剩余内容已写到 {dest}（{copied} 字节）"
+        if copied < remaining:
+            hint += f"；源文件还有 {remaining - copied} 字节未复制（单次上限 {_SPILL_REMAINDER_LIMIT} 字节）"
+        hint += "；可用 read_file(path=该文件) 或 spawn 继续处理"
+        return {
+            "locator": f"Runtime/spill/{dest.name}",
+            "bytes": copied,
+            "file_bytes": total,
+            "remainder_bytes": remaining,
+            "truncated": copied < remaining,
+            "hint": hint,
+        }
 
     # ---- 同步工具 ----
     def _tool_read_file(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -268,30 +345,32 @@ class ToolBox:
         truncated_by_bytes = False
         line_truncated = False
         has_more = False
+        spill: dict[str, Any] | None = None
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            with open(path, "rb") as handle:
                 for _ in range(offset):
-                    if handle.readline() == "":
+                    if handle.readline() == b"":
                         break
                 for _ in range(limit):
-                    line = handle.readline()
-                    if line == "":
+                    start_position = handle.tell()
+                    raw_line = handle.readline()
+                    if raw_line == b"":
                         break
-                    encoded = len(line.encode("utf-8"))
-                    if bytes_used + encoded > MAX_READ_BYTES:
+                    if bytes_used + len(raw_line) > MAX_READ_BYTES:
                         if not lines:
                             # 单行就超过字节上限：给出截断预览，避免死循环
-                            lines.append(line[: MAX_READ_BYTES // 4])
+                            lines.append(raw_line[: MAX_READ_BYTES // 4].decode("utf-8", errors="replace"))
                             line_truncated = True
                             has_more = True
                         else:
                             truncated_by_bytes = True
                             has_more = True
+                        spill = self._spill_remainder(path, start_position)
                         break
-                    bytes_used += encoded
-                    lines.append(line.rstrip("\n"))
+                    bytes_used += len(raw_line)
+                    lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
                 else:
-                    if handle.readline() != "":
+                    if handle.readline() != b"":
                         has_more = True
         except OSError as exc:
             raise _ToolError("io_error", f"读取失败：{exc}") from None
@@ -306,10 +385,12 @@ class ToolBox:
             "has_more": has_more,
             "data": text,
         }
+        if spill is not None:
+            payload["spill"] = spill
         if truncated_by_bytes:
             payload["note"] = f"本次返回达到 {MAX_READ_BYTES} 字节上限，请用 offset={next_offset} 继续读"
         if line_truncated:
-            payload["note"] = "有单行超过字节上限，已截断；建议用 spawn 配合 head/awk 等命令处理"
+            payload["note"] = "有单行超过字节上限，已截断；剩余内容见 spill"
         return payload
 
     def _tool_list_dir(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -346,6 +427,9 @@ class ToolBox:
     # ---- 异步任务 ----
     def _tool_spawn(self, args: dict[str, Any]) -> dict[str, Any]:
         command = str(args.get("command") or "")
+        refusal = check_signal_command(command)
+        if refusal:
+            raise _ToolError("self_guard", refusal)
         cwd = args.get("cwd")
         label = args.get("label")
         timeout = _as_int(args.get("timeout_seconds"), 0, minimum=0)
@@ -379,6 +463,10 @@ class ToolBox:
     def _tool_job_kill(self, args: dict[str, Any]) -> dict[str, Any]:
         job_id = str(args.get("job_id") or "")
         try:
+            target = self.jobs.load(job_id)
+            refusal = check_pid(target.pid)
+            if refusal:
+                raise _ToolError("self_guard", refusal)
             job = self.jobs.kill(job_id)
         except FileNotFoundError:
             raise _ToolError("not_found", f"任务不存在：{job_id}") from None
@@ -398,6 +486,8 @@ class ToolBox:
                     return {"job": job.to_dict(), "waited": False, "interrupted": "stop"}
                 if state["run"] == "pause":
                     return {"job": job.to_dict(), "waited": False, "interrupted": "pause"}
+                if self.control.consume_wake():
+                    return {"job": job.to_dict(), "waited": False, "interrupted": "wake"}
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return {"job": job.to_dict(), "waited": False, "timeout": True}

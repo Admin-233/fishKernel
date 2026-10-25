@@ -17,7 +17,10 @@ from .control import Control
 from .events import EventLog, read_events
 from .jobs import Job, JobManager
 from .llm import Completion, ContextOverflowError, LLMClient, OpenAIClient
+from .lock import InstanceLock, LockError
 from .messages import build_messages
+from .restart import spawn_successor
+from .spill import cleanup as spill_cleanup
 from .tokens import TokenMeter, estimate_messages, estimate_tools
 from .tools import ToolBox
 
@@ -63,6 +66,7 @@ class Kernel:
         self.events = EventLog(self.archive.events_path).open()
         self.control = Control(self.archive)
         self.jobs = JobManager(self.archive)
+        self.lock = InstanceLock(self.archive.lock_path)
         self.meter = TokenMeter()
         self.toolbox = ToolBox(self.archive, self.jobs, self.control)
         self.client: LLMClient = client or OpenAIClient(self.config)
@@ -78,6 +82,11 @@ class Kernel:
 
     # ---- 生命周期 ----
     def run(self) -> int:
+        try:
+            self.lock.acquire(timeout=5.0)
+        except LockError as exc:
+            self.logger.error(str(exc))
+            raise
         self._install_signals()
         reason = "max_turns"
         self.events.append(
@@ -88,9 +97,15 @@ class Kernel:
             max_tokens=self.config.max_tokens,
             pid=os.getpid(),
         )
+        history = read_events(self.archive.events_path)
+        if not any(event.type == "user/message" for event in history):
+            # 首次启动的欢迎语；重启/交班不会重复写
+            self.events.append("user/message", text="你开始运行了，欢迎", source="init")
+            self.archive.append_history("用户：你开始运行了，欢迎")
         self._write_state("running")
         self.archive.rewrite_history(read_events(self.archive.events_path))
         self.meter.restore(read_events(self.archive.events_path), self.archive.system_text(), self.toolbox.specs())
+        spill_cleanup(self.archive.spill_dir)
         self.logger.info(
             f"内核启动：{self.config.name} / {self.config.spec.name}；"
             f"压缩阈值 {self.compressor.threshold}，保留 {self.compressor.retain} tokens；{self.meter.describe()}"
@@ -115,6 +130,12 @@ class Kernel:
                 if state["run"] == "stop":
                     reason = "stop"
                     break
+                restart_request = self.control.consume_restart()
+                if restart_request is not None:
+                    if self._handover(restart_request):
+                        reason = "restart"
+                        break
+                    self.logger.warn("交班失败，继续运行")
                 if state["run"] == "pause":
                     # 暂停时不消耗 API，也不能空转烧 CPU；0.5s 粒度响应用户指令
                     time.sleep(0.5)
@@ -149,9 +170,25 @@ class Kernel:
             self._write_state("stopped")
             self.events.append("session/end", reason=reason, turns=self.turns)
             self.events.close()
+            self.lock.release()
             self._restore_signals()
             self.logger.info(f"内核退出：{reason}（共 {self.turns} 轮）")
         return 0
+
+    def _handover(self, request: dict[str, object] | None = None) -> bool:
+        """交班：先启动接班人，再释放锁，然后由调用方正常退出。"""
+        try:
+            target = spawn_successor(self.archive)
+        except Exception as exc:  # noqa: BLE001 - 交班失败不能让旧进程直接死掉
+            self.logger.error(f"交班启动失败：{exc}")
+            self.events.append("error", stage="handover", message=f"{type(exc).__name__}: {exc}"[:800], retryable=False)
+            return False
+        reason = (request or {}).get("reason") if isinstance(request, dict) else None
+        self.events.append("session/handover", target=target, pid=os.getpid(), reason=reason)
+        # 锁在 finally 里、写完 session/end 之后再释放：
+        # 让旧进程的最后几条事件排在 session/start 之前，避免两个写者同时追加。
+        self.logger.info(f"已启动接班进程 {target}，本进程收尾后释放实例锁")
+        return True
 
     # ---- 单轮 ----
     def _turn(self, turn: int, state: dict[str, object]) -> None:
@@ -209,6 +246,8 @@ class Kernel:
         delay = state.get("delay")
         delay = float(delay) if isinstance(delay, (int, float)) else self.config.turn_delay
         slept, why = self.control.interruptible_sleep(delay)
+        if slept > 0:
+            self.events.append("delay", seconds=round(slept, 2), reason=why)
         self.events.append("turn/end", turn=turn, reason=why, slept_seconds=round(slept, 2))
         self._write_state("running")
 
@@ -238,10 +277,11 @@ class Kernel:
         self, completion: Completion, turn: int, *, prompt_seq: int = -1, pressure: int = 0
     ) -> None:
         calls = [call.to_dict() for call in completion.tool_calls]
+        reasoning = completion.reasoning or ""
         self.events.append(
             "assistant/message",
-            text=completion.text,
-            reasoning=completion.reasoning[:4000],
+            text=completion.text or "",
+            reasoning=str(reasoning)[:4000],
             tool_calls=calls,
             usage=completion.usage,
             prompt_seq=prompt_seq,

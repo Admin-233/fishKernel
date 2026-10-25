@@ -63,3 +63,26 @@ def test_inbox_partial_line_waits(archive):
     with open(archive.inbox_path, "ab") as handle:
         handle.write(line[cut:] + b"\n")
     assert control.poll_inbox() == ["半行"]
+
+
+def test_wake_interrupts_sleep(archive):
+    control = Control(archive)
+    control.request_wake()
+    slept, why = control.interruptible_sleep(5)
+    assert why == "wake"
+    assert slept < 1
+
+
+def test_wake_consumed_once(archive):
+    control = Control(archive)
+    control.request_wake()
+    assert control.consume_wake() is True
+    assert control.consume_wake() is False
+
+
+def test_restart_request_consumed_once(archive):
+    control = Control(archive)
+    control.request_restart("test")
+    first = control.consume_restart()
+    assert first is not None and first.get("reason") == "test"
+    assert control.consume_restart() is None

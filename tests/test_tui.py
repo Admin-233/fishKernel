@@ -85,7 +85,7 @@ def test_render_user_message_has_color_and_text():
 
 
 def test_render_assistant_caps_long_text():
-    lines = render_event(ev(2, "assistant/message", text="字" * 500), 40)
+    lines = render_event(ev(2, "assistant/message", text="字" * 3000), 20)
     assert len(lines) <= MAX_ASSISTANT_LINES
     assert "还有" in lines[-1].text
 
@@ -116,6 +116,7 @@ def test_render_error_and_compaction():
 
 def test_wake_notice_is_hidden():
     assert render_event(ev(8, "system/message", text="唤醒", kind="wake"), 80) == []
+    assert render_event(ev(9, "delay", seconds=1.0, reason="elapsed"), 80) == []
 
 
 # ---------------- 整帧 ----------------
@@ -284,6 +285,15 @@ def test_hint_shows_scroll_state(archive):
     app = TuiApp(archive.root, snapshot=True, color=False, width=80, height=20)
     app.scroll = 5
     assert "滚动" in app._hint().text
+
+
+def test_follow_mode_prints_and_exits_when_stopped(archive, log, capsys):
+    log.append("user/message", text="跟随模式")
+    app = TuiApp(archive.root, color=False, width=80, height=12)
+    app._stop = True
+    assert app.run() == 0
+    out = capsys.readouterr().out
+    assert "跟随模式" in out
 
 
 def test_home_edits_input_when_not_empty_else_scrolls(archive, log):

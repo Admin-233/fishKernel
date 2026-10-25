@@ -28,11 +28,11 @@ STYLE_STATUS = "1;97;44"
 STYLE_INPUT = "1;37"
 STYLE_HINT = "90"
 
-MAX_USER_LINES = 8
-MAX_ASSISTANT_LINES = 14
-MAX_SYSTEM_LINES = 4
-MAX_ERROR_LINES = 6
-MAX_UNKNOWN_LINES = 2
+MAX_USER_LINES = 200
+MAX_ASSISTANT_LINES = 400
+MAX_SYSTEM_LINES = 100
+MAX_ERROR_LINES = 60
+MAX_UNKNOWN_LINES = 40
 
 
 @dataclass(frozen=True)
@@ -269,6 +269,10 @@ def render_event(event: Event, width: int) -> list[Line]:
         exit_code = data.get("exit_code")
         suffix = f" · exit {exit_code}" if exit_code is not None else ""
         return [Line(truncate(f"{prefix}⚙ 任务 {data.get('job_id', '?')} {status}{suffix}", width), STYLE_JOB)]
+    if event.type == "session/handover":
+        return [Line(truncate(f"⇄ 交班 → 新进程 {data.get('target', '?')}（旧 pid {data.get('pid', '?')}）", width), STYLE_JOB)]
+    if event.type == "delay":
+        return []  # 每轮都有，属于噪音；时间流逝由状态条体现
     if event.type == "compaction/start":
         return [Line(f"{prefix}◆ 压缩开始（{data.get('trigger', '?')}）", STYLE_COMPACT)]
     if event.type == "compaction/summary":

@@ -169,8 +169,10 @@ class TuiApp:
         self._ensure_primed()
         if self.snapshot:
             return self._run_snapshot()
-        if self.plain or not is_tty():
+        if self.plain:
             return self._run_plain()
+        if not is_tty():
+            return self._run_follow()
         return self._run_interactive()
 
     def _ensure_primed(self) -> None:
@@ -231,7 +233,7 @@ class TuiApp:
         if self.scroll > 0:
             return Line(f"已向上滚动 {self.scroll} 行 · End 回到底部 · PgDn 下翻", STYLE_HINT)
         return Line(
-            "Enter 发送 · :pause :resume :stop :delay N · PgUp/PgDn 滚动 · Ctrl-C 退出",
+            "Enter 发送 · :pause :resume :stop :wake :restart · PgUp/PgDn 滚动 · Ctrl-C 退出",
             STYLE_HINT,
         )
 
@@ -265,6 +267,19 @@ class TuiApp:
 
     def _run_snapshot(self) -> int:
         sys.stdout.write(self._snapshot_frame() + "\n")
+        return 0
+
+    def _run_follow(self) -> int:
+        """非终端环境：持续按行打印新事件，直到被停止（适合 nohup / 管道 / CI）。"""
+        feed_height = max(1, self._cur_height - 4)
+        for line in self.feed.visible(feed_height, 0):
+            print(self._paint(line), flush=True)
+        try:
+            while not self._stop:
+                self._poll(emit=True)
+                time.sleep(self.refresh)
+        except KeyboardInterrupt:
+            pass
         return 0
 
     def _run_plain(self) -> int:
@@ -411,7 +426,11 @@ class TuiApp:
                 self.scroll = max(0, self.scroll - max(1, feed_height - 1))
             return
         if key == "ESC":
-            self.editor.clear()
+            if self.editor.text:
+                self.editor.clear()
+            else:
+                self.control.request_wake()
+                self._set_flash("已请求唤醒")
             return
         submitted = self.editor.handle(key)
         if submitted is not None:
@@ -444,6 +463,12 @@ class TuiApp:
         elif name == "stop":
             self.control.write_state(run="stop")
             self._set_flash("已请求停止，内核会收尾退出")
+        elif name in {"wake", "w"}:
+            self.control.request_wake()
+            self._set_flash("已请求唤醒，内核会提前结束当前等待")
+        elif name in {"restart", "reload"}:
+            self.control.request_restart("tui")
+            self._set_flash("已请求交班重启，新进程会在旧进程退出后接管")
         elif name == "delay":
             try:
                 value = float(parts[1])

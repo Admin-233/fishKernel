@@ -55,3 +55,13 @@ def test_event_json_roundtrip():
     event = Event(seq=5, ts="t", type="user/message", data={"text": "中"})
     parsed = Event.from_json(event.to_json())
     assert parsed == event
+
+
+def test_last_seq_survives_huge_last_line(archive):
+    path = archive.events_path
+    lines = [json.dumps({"seq": index, "ts": "", "type": "x", "data": {}}) for index in range(1, 6)]
+    huge = json.dumps({"seq": 6, "ts": "", "type": "x", "data": {"text": "x" * 100_000}})
+    path.write_text("\n".join(lines + [huge]) + "\n", encoding="utf-8")
+    log = EventLog(path).open()
+    assert log.last_seq == 6
+    log.close()

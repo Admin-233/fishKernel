@@ -112,6 +112,18 @@ class Archive:
         return self.control_dir / "inbox.offset"
 
     @property
+    def wake_path(self) -> Path:
+        return self.control_dir / "wake"
+
+    @property
+    def restart_path(self) -> Path:
+        return self.control_dir / "restart"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.runtime_dir / "kernel.lock"
+
+    @property
     def jobs_dir(self) -> Path:
         return self.runtime_dir / "jobs"
 
@@ -221,6 +233,8 @@ def render_event_line(event: Event) -> str | None:
         return f"[等待] {event.data.get('seconds')} 秒"
     if event.type == "compaction/summary":
         return f"[压缩] 已压缩至 seq {event.data.get('to_seq')}，释放约 {event.data.get('freed_tokens')} tokens"
+    if event.type == "session/handover":
+        return f"[交班] 新进程 {event.data.get('target')}（旧 pid {event.data.get('pid')}）"
     return None
 
 
@@ -265,7 +279,7 @@ def create_archive(
     write_atomic(archive.long_term_memory_path, "")
     write_atomic(archive.digest_path, "")
     write_atomic(archive.register_path, DEFAULT_TOOLS_REGISTER)
-    write_atomic(archive.history_path, "用户：你开始运行了，欢迎\n")
+    write_atomic(archive.history_path, "")
     write_atomic(archive.events_path, "")
 
     # 给个示例工具目录，示范 Usage.txt 格式

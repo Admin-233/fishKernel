@@ -16,10 +16,13 @@ fishkernel run <存档目录> [--max-turns N] [--once] [--mock] [--quiet]
 ## 控制
 
 ```bash
-fishkernel ctl <目录> pause|resume|stop|delay [秒数]
+fishkernel ctl <目录> pause|resume|stop|delay|wake|restart [秒数]
 fishkernel say <目录> "文本"
 fishkernel status <目录> [--tail N] [--jobs]
 ```
+
+- `wake`：写一个 `Runtime/control/wake` 标记，正在 `sleep` 或 `wait_job` 的内核会在 0.2 秒内醒来。
+- `restart`：交班重启。旧进程启动新进程 → 写 `session/handover` → 写完 `session/end` 后在 `finally` 里释放实例锁 → 自己退出；新进程在锁上等待后接管。全程不给自己发信号。
 
 实现上都是改存档里的文件：
 
@@ -27,6 +30,8 @@ fishkernel status <目录> [--tail N] [--jobs]
 |---|---|
 | `Runtime/control/state.json` | `{"run": "run|pause|stop", "delay": 秒}`，原子写 |
 | `Runtime/control/inbox.jsonl` | 用户消息队列，内核按偏移增量消费 |
+| `Runtime/control/wake` | 唤醒标记，内核读取后删除（只生效一次） |
+| `Runtime/control/restart` | 交班请求，内核读取后删除 |
 
 因此控制器可以是任意进程、任意机器（只要共享目录或通过 ssh）。
 
@@ -64,9 +69,26 @@ jq -c 'select(.type=="tool/result")|{name,ok,duration_ms}' archives/demo/Runtime
 1. 截断事件日志里未写完的最后一行；
 2. 结算 pid 已不存在的异步任务（标记 `failed`），接管仍活着的（标记 `adopted`）；
 3. 给未闭合的压缩事务补 `compaction/abort{stale}`；
-4. 从最后一个成功的 `usage` 恢复 token 锚点；如果之后发生过压缩，退回估算。
+4. 从最后一个成功的 `usage` 恢复 token 锚点；如果之后发生过压缩，退回估算；
+5. 清理过旧的 spill 文件（保留最近 200 个、总量 50 MB）。
 
-恢复后模型会看到一条 `[runtime]` 通知，知道上次中断和任务状态。
+首次启动会补一条欢迎语 `user/message(source="init")`；重启或交班不会重复写。
+
+`Runtime/kernel.lock` 是单实例锁，进程退出时由操作系统自动释放，不会留下"假占用"。
+
+### 交班重启
+
+```bash
+fishkernel ctl archives/demo restart
+```
+
+事件序列（判断是否成功）：
+
+```
+session/handover → session/end(reason=restart) → session/start(新 pid) → turn/start
+```
+
+新进程通过 `python -m fishkernel run <目录>` 启动，stdout/stderr 丢弃，日志仍写 `Runtime/kernel.log`。交班失败（比如新进程起不来）时旧进程会记录错误并继续运行。
 
 ## 清理
 
@@ -78,7 +100,7 @@ ls archives/demo/Memory/Archive-*.txt | wc -l
 ```
 
 - `jobs/` 只保留最近 100 个目录，自动清理更旧的。
-- `spill/` 保留最近 200 个文件且总量 50 MB。
+- `spill/` 保留最近 200 个文件且总量 50 MB，内核启动时自动清理。
 - `Archive-*.txt`、`events.jsonl`、`Memory/` **不会自动清理**；长跑需要手动归档或自己加轮转。
 
 安全清理顺序：先 `stop` 并确认进程退出，再删 `Runtime/` 下的旧文件。不要删 `events.jsonl` 之外还在被引用的 Archive。
@@ -106,9 +128,9 @@ pip install -e '.[dev]'
 
 ## 单实例约束
 
-同一个存档**只能**有一个内核进程。当前没有加锁，同时跑两个会互相覆盖 `events.jsonl`。
+同一个存档**只能**有一个内核进程。`Runtime/kernel.lock` 用 `flock`（Windows 用 `msvcrt.locking`）强制这一点：第二个进程会等待最多 5 秒，然后报 `LockError` 退出。
 
-需要并行就跑多个存档（各自目录、各自 Key/模型）。
+需要并行就跑多个存档（各自目录、各自 Key/模型）。要换进程用 `ctl restart` 交班，不要直接 kill 再起。
 
 ## 资源与成本
 

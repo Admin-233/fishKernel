@@ -23,6 +23,10 @@
 | 上下文压缩 | 阈值按模型窗口与输出预留推导；按消息边界选区；分块摘要；事务化提交 |
 | token 计量 | 以 API 返回的 `usage` 为锚点，只对新增内容估算，并用实测比例校准 |
 | 控制通道 | 暂停/恢复/停止/调延时/注入消息，全部通过存档内文件，任意进程或远程 shell 都能操作 |
+| 单实例锁 | `flock`/`msvcrt` 锁住存档，第二个内核会被拒绝，不会写坏事件日志 |
+| 交班重启 | `ctl restart`：旧进程先启动新进程，再释放锁并正常退出，不给自己发信号 |
+| 唤醒 | `ctl wake` 或 TUI 的 `:wake`，让等待中的内核提前结束延时 |
+| 自我保护 | 拒绝终止内核自身、父进程或同进程组的命令（只挡这一种，不是沙箱） |
 | 终端界面 | `fishkernel tui`：上半屏实时事件流、下半屏输入框，分类着色，长工具调用自动压缩 |
 | 崩溃恢复 | 未闭合的压缩事务、孤儿工具调用、孤儿进程都有明确处理路径 |
 | 可插拔工具 | `Tools/` 目录登记命令行工具用法，模型通过 `spawn` 调用 |
@@ -55,6 +59,8 @@ fishkernel say ./archives/demo "去 Tools 目录看看有什么可用的"
 fishkernel ctl ./archives/demo pause        # 暂停（不消耗 API）
 fishkernel ctl ./archives/demo resume
 fishkernel ctl ./archives/demo delay 5      # 每轮延时改为 5 秒
+fishkernel ctl ./archives/demo wake         # 提前结束当前等待
+fishkernel ctl ./archives/demo restart      # 交班重启
 fishkernel ctl ./archives/demo stop
 ```
 
@@ -170,7 +176,7 @@ effort = high            # 可选：low / high / max，由服务端处理
 fishkernel new   <目录> [--name ...] [--model ...] [--api-key ...] [--max-tokens ...] [--turn-delay ...]
 fishkernel run   <目录> [--max-turns N] [--once] [--mock] [--quiet]
 fishkernel tui   <目录> [--plain] [--snapshot] [--no-color] [--width N] [--height N] [--refresh 秒]
-fishkernel ctl   <目录> pause|resume|stop|delay [秒数]
+fishkernel ctl   <目录> pause|resume|stop|delay|wake|restart [秒数]
 fishkernel say   <目录> <文本...>
 fishkernel status <目录> [--tail N] [--jobs]
 ```
@@ -199,13 +205,14 @@ fishkernel status <目录> [--tail N] [--jobs]
 ## 安全模型
 
 - **全权限**：`spawn` 不设白名单，模型可以读写这台机器上的任何东西。这是 v1 的设计决定，不是遗漏。
+- `selfguard` 只拒绝"终止内核自身/父进程/同进程组"这一类命令，不限制删文件、改系统配置等其它破坏性操作。
 - 没有审批、没有预算上限、没有空闲退避（节奏只有 `turn_delay`）。
 - 因此只能跑在一次性/隔离的测试机上；不要把宿主机、生产凭证或私人文件放进去。
 
 ## 测试
 
 ```bash
-# 单测（93 项，不联网）
+# 单测（111 项，不联网）
 python -m pytest -q
 
 # 推送隔离测试机 → 建 venv → 安装 → 跑全部测试
@@ -226,7 +233,7 @@ python scripts/deploy.py --real-api
 ```
 fishKernel/
 ├── src/fishkernel/        # 内核源码
-├── tests/                 # pytest（93 项）
+├── tests/                 # pytest（111 项）
 ├── scripts/               # 部署与联调脚本
 ├── docs/                  # 使用文档
 ├── ARCHITECTURE.md        # 实现规范（协议、事务、恢复）
@@ -236,7 +243,7 @@ fishKernel/
 
 ## 已知限制
 
-1. 一个存档只能跑一个内核实例，没有并发锁；同时跑两个会写坏事件日志。
+1. 一个存档只能跑一个内核实例：现在有文件锁强制，第二个会报 `LockError`（交班重启除外）。
 2. `events.jsonl` 只增不减，长跑持续变大（压缩只写 `Archive-*.txt`，不改写日志）。
 3. token 的新增部分仍是估算（误差 0.6%–5%），未接入官方离线分词器。
 4. 异步任务不跨内核重启续期，只能接管观察；孤儿进程输出无人回收。

@@ -105,3 +105,32 @@ def test_spill_roundtrip(archive):
     body, truncated = preview("x" * 20_000, limit_chars=100)
     assert truncated is True
     assert "中间内容已省略" in body
+
+
+def test_tool_result_text_stays_valid_json(archive):
+    from fishkernel.constants import MAX_INLINE_RESULT_CHARS
+    from fishkernel.tools import ToolResult
+
+    result = ToolResult(
+        ok=True,
+        payload={"ok": True, "data": "长" * 100_000, "nested": {"blob": "y" * 20_000}},
+        name="job_output",
+        spill_dir=archive.spill_dir,
+    )
+    text = result.text
+    parsed = json.loads(text)  # 关键：永远是合法 JSON
+    assert parsed["ok"] is True
+    assert parsed["data"]["locator"].startswith("Runtime/spill/")
+    assert len(text) <= MAX_INLINE_RESULT_CHARS
+    assert (archive.root / parsed["data"]["locator"]).is_file()
+
+
+def test_read_file_spills_remainder(archive):
+    path = archive.root / "huge.txt"
+    path.write_text("x" * 300_000, encoding="utf-8")
+    result = make_toolbox(archive).dispatch("read_file", json.dumps({"path": "huge.txt", "limit": 5}))
+    assert result.ok
+    payload = result.payload
+    assert payload["has_more"] is True
+    assert "spill" in payload
+    assert (archive.root / payload["spill"]["locator"]).is_file()

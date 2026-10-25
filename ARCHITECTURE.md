@@ -34,13 +34,16 @@ v1 交付：一个能长时间自主运行的内核 + 命令行控制面。
 ├── Tools/
 │   ├── ToolsRegister.txt       # 每行一个已启用工具名，# 注释
 │   └── <工具名>/Usage.txt      # 该工具给模型看的说明
-└── Runtime/
+├── Runtime/
     ├── events.jsonl            # 唯一事实来源，只追加
     ├── kernel.json             # 内核自述：pid / 启动时间 / 轮次 / 状态
+    ├── kernel.lock             # 单实例锁（flock / msvcrt）
     ├── kernel.log              # 运行日志
     ├── control/
     │   ├── state.json          # {"run": "run|pause|stop", "delay": 1.0}
-    │   └── inbox.jsonl         # 用户消息队列（控制器追加）
+    │   ├── inbox.jsonl         # 用户消息队列（控制器追加）
+    │   ├── wake                # 唤醒标记（读后删除）
+    │   └── restart             # 交班请求（读后删除）
     ├── jobs/<job-id>/          # 异步进程：meta.json, stdout.log, stderr.log
     └── spill/<name>.txt        # 超长输出的完整副本
 ```
@@ -65,7 +68,8 @@ turn_delay = 1.0           # 每轮基础延时（秒）
 | type | data | 说明 |
 |---|---|---|
 | `session/start` | `{model, context_window}` | 内核启动 |
-| `session/end` | `{reason}` | 退出（stop / max-turns / 信号） |
+| `session/handover` | `{target, pid, reason}` | 交班：新进程 pid 已启动，旧进程即将释放锁退出 |
+| `session/end` | `{reason}` | 退出（stop / max-turns / restart / 信号） |
 | `turn/start` | `{turn}` | 一轮开始 |
 | `turn/end` | `{turn, reason}` | 一轮结束 |
 | `user/message` | `{text, source}` | 用户/控制通道输入 |
@@ -73,7 +77,7 @@ turn_delay = 1.0           # 每轮基础延时（秒）
 | `tool/result` | `{call_id, name, ok, output, spill?, job_id?, duration_ms}` | 工具执行结果 |
 | `job/start` | `{job_id, command, cwd}` | 异步进程已启动 |
 | `job/settle` | `{job_id, status, exit_code, duration_ms}` | 异步进程终止 |
-| `delay` | `{seconds, reason}` | 模型请求延时 |
+| `delay` | `{seconds, reason}` | 一轮结束后的实际等待时长（reason: elapsed/wake/pause/stop） |
 | `system/message` | `{text, kind}` | 运行时通知（如任务完成），投影为用户可见消息 |
 | `compaction/start` | `{trigger, threshold, pressure}` | 压缩事务开始（持久锁） |
 | `compaction/summary` | `{summary, from_seq, to_seq, archived, freed_tokens}` | 压缩成果 |
@@ -93,18 +97,21 @@ turn_delay = 1.0           # 每轮基础延时（秒）
 1. 系统提示词 = `Agent.txt` + 已登记工具的 `Usage.txt`（带编号标题）+ 非空 `LongTermMemory.txt` + 非空 `Digest.txt`。
 2. 从最近的 `compaction/summary` 之后开始投影；该概要投影为一条 `<compacted-summary>…</compacted-summary>` 的 user 消息。
 3. `assistant/message` 带 `tool_calls` 时，必须紧跟每个调用对应的 `tool/result`。若事件流里缺失（崩溃残留），投影时补一条 `TOOL_OUTCOME_UNKNOWN` 的 tool 结果，保证配对完整。
-4. `system/message` 投影为带 `[runtime]` 前缀的 user 消息；连续的同前缀消息合并成一个。
+4. `system/message` 投影为带 `[runtime]` 前缀的 user 消息；只有**双方都带该前缀**的连续消息才合并，真实用户发言不会被吞。
 5. `delay` 投影为 `[runtime] 等待 N 秒`，让模型知道时间过去了。
 
 ## 6. 主循环
 
 ```
-recover()            # 接管/清理遗留异步进程；修复未闭合的压缩事务
+acquire lock          # 失败则报 LockError；交班时新进程在这里等待
+recover()             # 接管/清理遗留异步进程；修复未闭合的压缩事务；清理 spill
 session/start
+if 历史上没有 user/message: 补欢迎语 user/message(source="init")
 loop:
   ctl = 读 state.json
   if stop: break
-  if pause: 睡 0.2s 后重读（期间仍响应 stop）
+  if restart 请求: _handover()  # 起新进程 → session/handover → break（锁在 finally 释放）
+  if pause: 睡 0.5s 后重读（期间仍响应 stop/restart）
   收 inbox 新消息 → user/message
   jobs.tick()        # 结超时/完成的进程 → job/settle + system/message
   if 压力 > 阈值: compress()          # 步骤见 §9
@@ -114,8 +121,10 @@ loop:
   对每个 tool_call（每轮上限 16）:
       result = 执行 → tool/result
   若无 tool_call: system/message "唤醒"（不伪造用户发言）
-  delay = 控制通道覆盖值 或 配置默认值；可中断睡眠
+  delay = 控制通道覆盖值 或 配置默认值；可中断睡眠（stop/pause/wake）
+  if slept > 0: delay
   turn/end
+release lock
 session/end
 ```
 
@@ -123,16 +132,18 @@ session/end
 
 ## 7. 工具协议
 
-用 OpenAI `tools`（function calling）。返回值统一是 JSON 字符串：
+用 OpenAI `tools`（function calling）。返回值统一是 JSON 字符串，且**永远是合法 JSON**：
 
 ```json
 {"ok": true, "result": ...}
 {"ok": false, "error": {"code": "not_found", "message": "..."}}
 ```
 
+超过 32 KiB 时不会切字符串，而是把超长字符串字段替换成溢出指针 `{locator, bytes, preview, hint}`；若仍超限，整份结果落 spill 并返回 `{ok, truncated, spill}`。
+
 | 工具 | 参数 | 行为 |
 |---|---|---|
-| `read_file` | `path, offset=0, limit=200` | 按行读；单次上限 256 KiB，超出部分落 spill |
+| `read_file` | `path, offset=0, limit=200` | 按行读；单次上限 256 KiB，超出时剩余内容写入 spill 并在 payload 里返回 `spill` 对象 |
 | `list_dir` | `path=".", limit=200` | 列目录；超出提示截断 |
 | `spawn` | `command, cwd=null, label=null, timeout_seconds=0` | 起异步进程，立即返回 `job_id`；stdout/stderr 落文件 |
 | `job_list` | – | 全部任务的状态投影 |
@@ -142,7 +153,7 @@ session/end
 | `sleep` | `seconds` | 可中断延时（≤3600） |
 | `memory` | `mode=append\|replace, content` | 写 `LongTermMemory.txt`（上限 64 KiB） |
 
-`spawn` 是权限面：不设命令白名单——这是设计决定，不是遗漏。
+`spawn` 是权限面：不设命令白名单——这是设计决定，不是遗漏。`selfguard` 只额外拒绝"终止内核自身/父进程/同进程组"的命令与 `job_kill` 目标。
 
 ## 8. 异步任务与长输出
 
@@ -176,8 +187,10 @@ session/end
 |---|---|---|---|
 | `control/state.json` | `ctl` | 内核（每轮 + 睡眠中） | `{"run":"run|pause|stop","delay":1.0}`，原子写 |
 | `control/inbox.jsonl` | `say` | 内核（按偏移增量读） | 每行 `{"ts","text"}`；偏移存 `control/inbox.offset` |
+| `control/wake` | `ctl wake` | 内核 | 存在即消费，睡眠与 `wait_job` 每 0.2s 检查 |
+| `control/restart` | `ctl restart` | 内核 | 存在即交班：启动新进程、释放锁、旧进程退出 |
 
-内核在延时期间每 0.2s 检查一次 `stop`，保证最多 0.2s 响应。`pause` 不消耗 API。
+内核在延时期间每 0.2s 检查一次 `stop` / `pause` / `wake`，保证最多 0.2s 响应。`pause` 不消耗 API。
 
 ## 11. 崩溃点与恢复
 
@@ -186,8 +199,10 @@ session/end
 | 写完 assistant 消息、未写 tool 结果 | 孤儿 tool_call | 投影补 `TOOL_OUTCOME_UNKNOWN`；日志可查 |
 | 工具执行到一半 | 无结果事件 | 同上；异步进程由 `jobs.recover()` 接管 |
 | 压缩中 | 未闭合 `compaction/start` | 启动时 `compaction/abort{stale}` |
-| 事件写一半 | 末行非法 JSON | 读取时跳过末行；追加前截断到最后一个换行 |
+| 事件写一半 | 末行非法 JSON | 读取时跳过末行；追加前截断到最后一个换行；`_last_seq` 反向分块扫描，末行超大也能读对 |
 | 控制文件写一半 | JSON 解析失败 | 视为缺省，继续运行 |
+| 内核崩溃 | 锁未显式释放 | `flock`/`msvcrt.locking` 由操作系统释放，不会假占用 |
+| 交班中途崩溃 | 新进程起不来 | 旧进程记录 error 并继续运行；锁仍归旧进程 |
 
 ## 12. 模型
 
@@ -208,10 +223,12 @@ session/end
 - 单元测试不联网、不执行模型，可以在任意环境跑。
 - `scripts/deploy.py`：打包 → scp → 解包 → 建 venv → `pip install -e .[dev]` → `pytest`；测试机地址与凭据由环境变量提供。
 - mock provider 覆盖：循环、工具、压缩、控制、崩溃恢复；真实 API 用 `--max-turns` 限轮次联调。
+- 当前 111 项测试；交班（`session/handover` → `session/end` → `session/start`）在测试机上手工验证。
 
 ## 14. 已知边界
 
 - token 数：已发送部分以 API `usage` 精确值为锚点，未发送的增量按启发式估算（ASCII 0.3 / 中文 0.6 / 其他 0.5，官方文档比例），并用实测比例校准。官方离线分词器（`deepseek_v4_tokenizer.zip`）可进一步做到全量精确，但需要 `transformers` 依赖，v1 未引入。
 - 异步任务不跨内核重启续期；只接管已启动的进程。
 - 无审批、无预算上限、无退避刹车——按 v1 决定。
+- `selfguard` 只拦"杀内核自己"这一类命令，不限制删文件、改系统配置等其它破坏性操作。
 - 事件日志不自动轮转；压缩会写入 Archive，但 `events.jsonl` 本身持续增长。
