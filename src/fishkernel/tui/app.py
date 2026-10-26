@@ -18,6 +18,8 @@ from ..events import Event, read_events
 from ..jobs import JobManager
 from .editor import LineEditor
 from .render import (
+    STYLE_ASSISTANT,
+    STYLE_USER,
     STYLE_DIM,
     STYLE_HINT,
     Line,
@@ -194,7 +196,45 @@ class TuiApp:
         self._rebuild(self._cur_width)
 
     # ---------------- 渲染 ----------------
-    def _rebuild(self, width: int) -> None:
+    # ---------------- 置顶聊天区 ----------------
+    CHAT_ROWS = 6          # 钉在顶部显示几行
+    CHAT_MAX_WIDTH = 68    # 单行最长多少字符，避免撑爆
+
+    def _refresh_chat(self) -> None:
+        """从事件里挑出"人的对话"，钉在顶部。
+
+        只收 user/message 与 assistant/message 的**正文**；
+        工具调用、任务结算、delay 这些噪音不进聊天区。
+        """
+        turns: list[tuple[str, str]] = []
+        for event in self.events:
+            if event.type == "user/message":
+                source = event.data.get("source")
+                text = str(event.data.get("text", "")).strip()
+                if text:
+                    label = "你" if source == "control" else "系统"
+                    turns.append((label, text))
+            elif event.type == "assistant/message":
+                text = str(event.data.get("text", "")).strip()
+                if text:
+                    turns.append(("我", text))
+        self._chat_turns = turns
+
+    def _chat_lines(self, width: int) -> list[Line]:
+        rows: list[Line] = []
+        limit = max(10, min(width, self.CHAT_MAX_WIDTH))
+        recent = getattr(self, "_chat_turns", [])[-3:]   # 最近 3 轮足够
+        for label, text in recent:
+            one_line = " ".join(text.split())
+            clipped = one_line[: limit - 2]
+            if len(one_line) > limit - 2:
+                clipped += "…"
+            style = STYLE_USER if label in {"你"} else STYLE_ASSISTANT
+            rows.append(Line(f"{label}│{clipped}", style))
+        return rows[-self.CHAT_ROWS :]
+
+    def _rebuild(self, width: int) -> None:  # noqa: D401
+        self._refresh_chat()
         self.feed.reset()
         lines: list[Line] = []
         for event in self.events:
@@ -250,7 +290,8 @@ class TuiApp:
     def _snapshot_frame(self) -> str:
         self._ensure_primed()
         self._rebuild(self._cur_width)
-        feed_height = max(1, self._cur_height - 4)
+        chat = self._chat_lines(self._cur_width)
+        feed_height = max(1, self._cur_height - 4 - len(chat))
         feed = self.feed.visible(feed_height, 0)
         hint = Line("快照模式 · 去掉 --snapshot 进入交互界面", STYLE_HINT)
         frame, _, _ = render_frame(
@@ -262,6 +303,7 @@ class TuiApp:
             cursor=0,
             hint=hint,
             color=self.color,
+            chat=self._chat_lines(self._cur_width),
         )
         return frame
 
@@ -345,7 +387,7 @@ class TuiApp:
 
     def _draw(self, term: Terminal) -> None:
         width, height = self._cur_width, self._cur_height
-        feed_height = max(1, height - 4)
+        feed_height = max(1, height - 4 - len(self._chat_lines(width)))
         frame, row, column = render_frame(
             width=width,
             height=height,
@@ -355,6 +397,7 @@ class TuiApp:
             cursor=self.editor.cursor,
             hint=self._hint(),
             color=self.color,
+            chat=self._chat_lines(width),
         )
         term.write(f"\x1b[?25l\x1b[H{frame}\x1b[{row};{column}H\x1b[?25h")
 

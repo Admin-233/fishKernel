@@ -47,13 +47,18 @@ def test_two_turns_with_tool_call(archive):
     assert isinstance(assistants[0].data["pressure_tokens"], int)
 
 
-def test_stop_state_prevents_turns(archive):
+def test_stop_is_transient_and_does_not_block_startup(archive):
+    """stop 是"对本次运行"的一次性指令，不跨进程生效。
+
+    历史行为：退出后 state.json 残留 stop，下次启动第一轮就退出，
+    用户必须先 :resume 才能启动。现在启动时会把它重置为 run。
+    """
     Control(archive).write_state(run="stop")
-    kernel = make_kernel(archive, [Completion(text="不应该被调用")], max_turns=3)
+    kernel = make_kernel(archive, [Completion(text="应该被调用")], max_turns=1)
     assert kernel.run() == 0
     events = read_events(archive.events_path)
-    assert not [event for event in events if event.type == "turn/start"]
-    assert events[-1].data["reason"] == "stop"
+    assert [event for event in events if event.type == "turn/start"], "stop 不该阻止新实例运行"
+    assert Control(archive).read_state()["run"] == "run"
 
 
 def test_error_then_recovery(archive):

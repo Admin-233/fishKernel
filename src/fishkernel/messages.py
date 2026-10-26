@@ -132,6 +132,16 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
         elif event.type == "delay":
             seconds = event.data.get("seconds")
             tail.append({"role": "user", "content": f"{RUNTIME_PREFIX}等待了 {seconds} 秒"})
+        elif event.type == "memory/write":
+            # 已登记、尚未落盘：压缩时会写进 LongTermMemory.txt
+            mode = event.data.get("mode", "append")
+            content = str(event.data.get("content", "")).strip()
+            tail.append(
+                {
+                    "role": "user",
+                    "content": f"{RUNTIME_PREFIX}长期记忆已登记（{mode}，压缩时落盘）：{content}",
+                }
+            )
         index += 1
 
     return head + _merge_runtime_user_messages(tail)
@@ -174,7 +184,7 @@ def conversation_units(events: list[Event]) -> list[list[Event]]:
     index = 0
     while index < len(body):
         event = body[index]
-        if event.type in {"user/message", "system/message", "delay"}:
+        if event.type in {"user/message", "system/message", "delay", "memory/write"}:
             units.append([event])
             index += 1
         elif event.type == "assistant/message":

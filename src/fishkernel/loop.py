@@ -68,7 +68,7 @@ class Kernel:
         self.jobs = JobManager(self.archive)
         self.lock = InstanceLock(self.archive.lock_path)
         self.meter = TokenMeter()
-        self.toolbox = ToolBox(self.archive, self.jobs, self.control)
+        self.toolbox = ToolBox(self.archive, self.jobs, self.control, self.events)
         self.client: LLMClient = client or OpenAIClient(self.config)
         if client is None:
             # 没有 Key 就在启动时报错，而不是每轮失败一次
@@ -102,6 +102,9 @@ class Kernel:
             # 首次启动的欢迎语；重启/交班不会重复写
             self.events.append("user/message", text="你开始运行了，欢迎", source="init")
             self.archive.append_history("用户：你开始运行了，欢迎")
+        # 上次退出时残留的 stop 是一次性指令，不该让新实例一启动就退出
+        if self.control.reset_stop_on_start():
+            self.logger.info("检测到上次遗留的 stop 状态，已重置为 run（stop 不跨进程生效）")
         self._write_state("running")
         self.archive.rewrite_history(read_events(self.archive.events_path))
         self.meter.restore(read_events(self.archive.events_path), self.archive.system_text(), self.toolbox.specs())

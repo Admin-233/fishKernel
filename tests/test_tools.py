@@ -134,3 +134,59 @@ def test_read_file_spills_remainder(archive):
     assert payload["has_more"] is True
     assert "spill" in payload
     assert (archive.root / payload["spill"]["locator"]).is_file()
+
+
+# ---- 长期记忆的延迟落盘语义 ----
+def test_memory_is_deferred_until_compaction(archive):
+    """memory 工具只登记事件，不立刻写 LongTermMemory.txt。
+
+    KernelDesign 3.2：该文件只由内核在压缩事务里写。
+    未触发压缩时，内容靠上下文本身被模型看到。
+    """
+    import json
+
+    from fishkernel.control import Control
+    from fishkernel.events import EventLog, read_events
+    from fishkernel.jobs import JobManager
+    from fishkernel.tools import ToolBox
+
+    log = EventLog(archive.events_path).open()
+    box = ToolBox(archive, JobManager(archive), Control(archive), log)
+    result = box.dispatch("memory", json.dumps({"mode": "append", "content": "记住这件事"}))
+    payload = json.loads(result.text)
+
+    assert payload["deferred"] is True
+    # 文件此时必须还是空的
+    assert archive.read_text(archive.long_term_memory_path).strip() == ""
+    # 但事件流里已经登记
+    writes = [e for e in read_events(archive.events_path) if e.type == "memory/write"]
+    assert len(writes) == 1
+    assert writes[0].data["content"] == "记住这件事"
+    log.close()
+
+
+def test_compaction_flushes_pending_memory(archive, config):
+    """压缩提交时，待写记忆必须落到 LongTermMemory.txt。"""
+    from fishkernel.compress import Compressor
+    from fishkernel.events import EventLog
+    from fishkernel.llm import Completion
+
+    class Fake:
+        def __init__(self):
+            self.usage = {"prompt_tokens": 10, "completion_tokens": 5}
+
+        def complete(self, messages, **kw):
+            return Completion(text="概要", usage={"prompt_tokens": 10, "completion_tokens": 5})
+
+    log = EventLog(archive.events_path).open()
+    log.append("user/message", text="一")
+    log.append("memory/write", mode="append", content="重要事实")
+    log.append("assistant/message", text="好的", tool_calls=[], usage={}, prompt_seq=1)
+    log.append("user/message", text="二")
+
+    comp = Compressor(archive, config, Fake(), log)
+    events = __import__("fishkernel.events", fromlist=["read_events"]).read_events(archive.events_path)
+    flushed = comp._flush_pending_memory(events)
+    assert flushed == 1
+    assert "重要事实" in archive.read_text(archive.long_term_memory_path)
+    log.close()

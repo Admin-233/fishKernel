@@ -14,6 +14,11 @@ from .archive import Archive
 from .atomic import write_atomic
 
 VALID_RUN_STATES = {"run", "pause", "stop"}
+
+# stop 是"对当前这次运行"的一次性指令，不是持久配置。
+# 内核一旦停下来退出，state.json 里残留的 stop 会让下次启动立刻退出，
+# 表现就是"必须 :resume 才能启动"。所以启动时要把它清成 run。
+TRANSIENT_RUN_STATES = {"stop"}
 POLL_INTERVAL_SECONDS = 0.2
 
 
@@ -37,6 +42,17 @@ class Control:
         if not isinstance(delay, (int, float)) or delay < 0:
             delay = None
         return {"run": run, "delay": float(delay) if delay is not None else None}
+
+    def reset_stop_on_start(self) -> bool:
+        """内核启动时调用：把上次遗留的 stop 清成 run，避免一启动就退出。
+
+        只处理 stop；pause 是有意保留的（用户可以暂停后重启，仍保持暂停）。
+        """
+        state = self.read_state()
+        if state.get("run") in TRANSIENT_RUN_STATES:
+            self.write_state(run="run")
+            return True
+        return False
 
     def write_state(self, *, run: str | None = None, delay: float | None = None) -> dict[str, object]:
         state = self.read_state()

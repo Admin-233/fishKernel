@@ -346,15 +346,24 @@ def render_frame(
     cursor: int,
     hint: Line,
     color: bool = True,
+    chat: list[Line] | None = None,
 ) -> tuple[str, int, int]:
-    """拼出整帧。返回 (帧文本, 光标行, 光标列)，行列从 1 开始。"""
+    """拼出整帧。返回 (帧文本, 光标行, 光标列)，行列从 1 开始。
+
+    chat 非空时，它会被"钉"在顶部（固定行数，不随滚动移动），
+    下方才是可滚动的完整事件流。用来把"你和我之间的对话"从
+    高速刷屏的工具输出里摘出来。
+    """
     width = max(24, width)
     height = max(6, height)
-    feed_height = height - 4  # 状态(1) + 分隔(1) + 输入(1) + 提示(1)
+    chat_rows = list(chat or [])
+    # 状态(1) + 分隔(1) + 输入(1) + 提示(1) = 4 行固定开销
+    feed_height = max(1, height - 4 - len(chat_rows))
     rows: list[Line] = [status]
+    rows.extend(chat_rows)
     visible = feed[-feed_height:]
     rows.extend(visible)
-    while len(rows) < 1 + feed_height:
+    while len(rows) < 1 + len(chat_rows) + feed_height:
         rows.append(Line(""))
     rows.append(Line("─" * width, STYLE_DIM))
     rows.append(Line("> " + input_text, STYLE_INPUT))

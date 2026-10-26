@@ -249,6 +249,40 @@ class Compressor:
             return summary, usage
         return best if best and estimate_text(best) < region_tokens else None, usage
 
+    def _flush_pending_memory(self, region_events: list[Event]) -> int:
+        """把被压缩区里的 memory/write 事件真正写入 LongTermMemory.txt。
+
+        设计（KernelDesign 3.2）：长期记忆只在压缩事务里落盘。
+        未压缩前，这些内容还活在上下文中，不需要抢占磁盘；
+        一旦它们即将被压缩掉，就必须落盘，否则会丢失。
+        """
+        pending = [event for event in region_events if event.type == "memory/write"]
+        if not pending:
+            return 0
+
+        replace_text: str | None = None
+        appended: list[str] = []
+        for event in pending:
+            mode = str(event.data.get("mode") or "append")
+            content = str(event.data.get("content") or "").strip()
+            if not content:
+                continue
+            if mode == "replace":
+                replace_text = content          # 后写覆盖先写
+                appended = []
+            else:
+                appended.append(content)
+
+        current = self.archive.read_text(self.archive.long_term_memory_path)
+        if replace_text is not None:
+            updated = replace_text + "\n"
+        else:
+            base = current.rstrip()
+            extra = "\n\n".join(appended)
+            updated = (base + "\n\n" + extra + "\n") if base else (extra + "\n")
+        self.archive.write_long_term_memory(updated)
+        return len(pending)
+
     def _commit(
         self,
         *,
@@ -270,6 +304,9 @@ class Compressor:
         from .atomic import write_atomic
 
         write_atomic(archived_path, header + body + "\n")
+        flushed = self._flush_pending_memory(region_events)
+        if flushed:
+            self._log(f"把 {flushed} 条待写记忆落盘到 LongTermMemory.txt")
         self.archive.write_digest(summary)
         summary_tokens = estimate_text(summary)
         freed = max(0, region_tokens - summary_tokens)

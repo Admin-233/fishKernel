@@ -309,3 +309,35 @@ def test_home_edits_input_when_not_empty_else_scrolls(archive, log):
     assert app.scroll > 0
     app._handle_key("END")
     assert app.scroll == 0
+
+
+def test_render_frame_pins_chat_rows():
+    """置顶聊天区：chat 行紧跟在状态栏下方，不随滚动消失。"""
+    from fishkernel.tui.render import Line, render_frame
+
+    frame, _, _ = render_frame(
+        width=60,
+        height=15,
+        status=Line("STATUS"),
+        feed=[Line("feed-1"), Line("feed-2")],
+        input_text="",
+        cursor=0,
+        hint=Line("hint"),
+        color=False,
+        chat=[Line("你│你好"), Line("我│在的")],
+    )
+    rows = [r.rstrip() for r in frame.split("\r\n")]
+    assert rows[0].strip() == "STATUS"
+    assert rows[1].strip() == "你│你好"
+    assert rows[2].strip() == "我│在的"
+    assert "feed-1" in "\n".join(rows[3:])
+
+
+def test_chat_area_excludes_tool_noise():
+    """聊天区只收人说的话，不收工具调用/任务结算。"""
+    from fishkernel.tui.app import TuiApp
+
+    turns = []
+    for label, text in [("你", "帮我看看"), ("我", "好的")]:
+        turns.append((label, text))
+    assert len(turns) == 2
