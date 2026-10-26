@@ -309,10 +309,11 @@ def test_home_edits_input_when_not_empty_else_scrolls(archive, log):
     app._handle_key("HOME")
     assert app.editor.cursor == 0
     app.editor.clear()
+    # 输入框为空时：Home/End 现在用于分栏翻页（跳到最早 / 回到最新）
     app._handle_key("HOME")
-    assert app.scroll > 0
+    assert app._left_page > 0
     app._handle_key("END")
-    assert app.scroll == 0
+    assert app._left_page == 0
 
 
 def test_render_frame_pins_chat_rows():
@@ -346,3 +347,61 @@ def test_chat_area_excludes_tool_noise():
     for label, text in [("你", "帮我看看"), ("我", "好的")]:
         turns.append((label, text))
     assert len(turns) == 2
+
+
+# ---- 分栏翻页 ----
+def test_left_pane_has_history_on_startup(archive, log):
+    """启动时左栏必须能读到历史对话（不能只显示最近几条）。"""
+    for i in range(20):
+        log.append("user/message", text=f"问{i}", source="control")
+        log.append("assistant/message", text=f"答{i}")
+    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=30)
+    app._ensure_primed()
+    app._refresh_chat()
+    assert len(app._chat_turns) == 40, "应加载全部 20 问 20 答"
+
+
+def test_paging_switches_focus_and_scrolls(archive, log):
+    """Tab 切焦点，PgUp 往回翻，PgDn 往前翻，各自独立。"""
+    for i in range(40):
+        log.append("user/message", text=f"m{i}", source="control")
+        # 右栏只收过程类事件，补 assistant + tool 才有内容可翻
+        log.append("assistant/message", text=f"答{i}")
+        log.append("tool/result", call_id=f"c{i}", name="list_dir", ok=True, output="{}")
+    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=20)
+    app._ensure_primed()
+    app._refresh_chat()
+
+    assert app._focus == "left"
+    app._handle_key("PGUP")
+    left_after = app._left_page
+    assert left_after > 0
+    assert app._right_page == 0, "左栏翻页不该影响右栏"
+
+    app._handle_key("TAB")
+    assert app._focus == "right"
+    app._handle_key("PGUP")
+    assert app._right_page > 0
+    assert app._left_page == left_after, "右栏翻页不该影响左栏"
+
+    app._handle_key("PGDN")
+    assert app._right_page < max(1, len(app._detail_lines))
+
+
+def test_paging_clamped_at_boundaries(archive, log):
+    """翻到边界不能越界（既不能负数，也不能超过总数）。"""
+    for i in range(10):
+        log.append("user/message", text=f"m{i}", source="control")
+    app = TuiApp(archive.root, snapshot=True, color=False, width=80, height=12)
+    app._ensure_primed()
+    app._refresh_chat()
+
+    # 疯狂往回翻
+    for _ in range(100):
+        app._handle_key("PGUP")
+    assert 0 <= app._left_page <= max(0, len(app._chat_turns) - 1)
+
+    # 疯狂往前翻
+    for _ in range(100):
+        app._handle_key("PGDN")
+    assert app._left_page == 0

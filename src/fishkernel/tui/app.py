@@ -33,7 +33,9 @@ from .render import (
 from .terminal import Terminal, is_tty
 
 MAX_FEED_LINES = 5000
-MAX_EVENTS = 2000
+# 事件缓存上限。左右栏要能翻历史，所以必须装得下完整会话；
+# 50000 条事件约 30MB 内存，对本工具可接受。
+MAX_EVENTS = 50_000
 STATUS_INTERVAL = 0.5
 JOBS_INTERVAL = 1.0
 
@@ -67,7 +69,8 @@ class FeedBuffer:
 class EventTail:
     """增量读取 events.jsonl，容忍末尾半行与文件被截断。"""
 
-    def __init__(self, path: Path, initial_bytes: int = 262_144):
+    def __init__(self, path: Path, initial_bytes: int = 0):
+        # initial_bytes=0 表示「从头读」，翻页需要完整历史。
         self.path = Path(path)
         self.initial_bytes = initial_bytes
         self.offset = 0
@@ -77,7 +80,7 @@ class EventTail:
         if not self.path.exists():
             return []
         size = self.path.stat().st_size
-        start = max(0, size - self.initial_bytes)
+        start = max(0, size - self.initial_bytes) if self.initial_bytes > 0 else 0
         with open(self.path, "rb") as handle:
             handle.seek(start)
             raw = handle.read()
@@ -200,6 +203,10 @@ class TuiApp:
     # ---------------- 渲染 ----------------
     # ---------------- 置顶聊天区 ----------------
     CHAT_SPLIT = 0.42      # 左栏（人机对话）占宽度的比例，其余给右栏（完整记录）
+    # 左右栏各自的翻页偏移：0 = 停在最新，正数 = 往回翻多少轮/行
+    _left_page = 0
+    _right_page = 0
+    _focus = "left"        # 当前用 PgUp/PgDn 翻哪一栏：left / right
     CHAT_ROWS = 0          # 运行时按终端高度计算，0 表示「占满消息区」
     CHAT_MAX_WIDTH = 68    # 单行最长多少字符，避免撑爆
 
@@ -256,9 +263,13 @@ class TuiApp:
         # 占满消息区：高度 - 状态(1) - 分隔(1) - 输入(1) - 提示(1)
         rows_n = height if height and height > 0 else self.CHAT_ROWS or 8
 
-        # ---- 左栏：最近几轮人机对话 ----
+        # ---- 左栏：人机对话（支持翻页）----
         left: list[Line] = []
-        recent = getattr(self, "_chat_turns", [])[-4:]
+        turns_all = getattr(self, "_chat_turns", [])
+        # 每条消息占一行，按行数翻页；_left_page 表示从末尾往回偏移多少行
+        end = max(0, len(turns_all) - self._left_page)
+        start = max(0, end - rows_n)
+        recent = turns_all[start:end]
         for label, text in recent:
             one_line = " ".join(text.split())
             clipped = one_line[: left_w - 2]
@@ -270,7 +281,10 @@ class TuiApp:
 
         # ---- 右栏：完整记录里的最近若干条（工具调用/结果/思维链）----
         right: list[Line] = []
-        for line in reversed(getattr(self, "_detail_lines", [])):
+        all_detail = getattr(self, "_detail_lines", [])
+        end_r = max(0, len(all_detail) - self._right_page)
+        start_r = max(0, end_r - rows_n * 2)   # 多取一些，跳过空行后仍能填满
+        for line in all_detail[start_r:end_r]:
             txt = " ".join(line.text.split())
             if not txt:
                 continue
@@ -278,9 +292,7 @@ class TuiApp:
             if len(txt) > right_w - 1:
                 clipped += "…"
             right.append(Line(clipped, line.style))
-            if len(right) >= rows_n:
-                break
-        right.reverse()
+        right = right[-rows_n:]
 
         # ---- 拼成两栏 ----
         out: list[Line] = []
@@ -505,6 +517,38 @@ class TuiApp:
                 self._jobs_running = 0
         return changed
 
+    # ---------------- 分栏翻页 ----------------
+    def _page_step(self) -> int:
+        """一页翻多少：取当前消息区可见行数的一半，避免一次翻过头。"""
+        body = max(1, self._cur_height - 4)
+        return max(1, body // 2)
+
+    def _page_by(self, delta: int) -> None:
+        """delta > 0 往回翻（更旧），delta < 0 往前翻（更新）。"""
+        if self._focus == "left":
+            total = len(getattr(self, "_chat_turns", []))
+            self._left_page = max(0, min(self._left_page + delta, max(0, total - 1)))
+            where = f"左栏 {self._left_page}/{max(0, total - 1)}"
+        else:
+            total = len(getattr(self, "_detail_lines", []))
+            self._right_page = max(0, min(self._right_page + delta, max(0, total - 1)))
+            where = f"右栏 {self._right_page}/{max(0, total - 1)}"
+        self._set_flash(f"已翻页 · {where}（Tab 切换栏）")
+
+    def _page_to_start(self) -> None:
+        if self._focus == "left":
+            self._left_page = max(0, len(getattr(self, "_chat_turns", [])) - 1)
+        else:
+            self._right_page = max(0, len(getattr(self, "_detail_lines", [])) - 1)
+        self._set_flash("已跳到最早（End 回最新）")
+
+    def _page_to_end(self) -> None:
+        if self._focus == "left":
+            self._left_page = 0
+        else:
+            self._right_page = 0
+        self._set_flash("已回到最新")
+
     # ---------------- 按键 ----------------
     def _handle_key(self, key: str) -> None:
         if key in {"CTRL_C", "EOF"}:
@@ -512,22 +556,32 @@ class TuiApp:
             return
         if key == "CTRL_L":
             return
-        if key in {"HOME", "END"}:
-            if self.editor.text:
+        if self.editor.text:
+            # 输入框有内容时，方向/翻页键交给编辑器
+            if key in {"HOME", "END", "PGUP", "PGDN"}:
                 self.editor.handle(key)
-            else:
-                feed_height = max(1, self._cur_height - 4)
-                self.scroll = self.feed.max_scroll(feed_height) if key == "HOME" else 0
-            return
-        if key in {"PGUP", "PGDN"}:
-            feed_height = max(1, self._cur_height - 4)
+                return
+        else:
+            # 分栏翻页：Tab 切换焦点栏，PgUp/PgDn 翻当前焦点，Home/End 跳首尾
+            if key == "TAB":
+                self._focus = "right" if self._focus == "left" else "left"
+                name = "左栏（对话）" if self._focus == "left" else "右栏（记录）"
+                self._set_flash(f"翻页焦点：{name}")
+                return
+            page = self._page_step()
             if key == "PGUP":
-                self.scroll = min(
-                    self.feed.max_scroll(feed_height), self.scroll + max(1, feed_height - 1)
-                )
-            else:
-                self.scroll = max(0, self.scroll - max(1, feed_height - 1))
-            return
+                self._page_by(page)
+                return
+            if key == "PGDN":
+                self._page_by(-page)
+                return
+            if key == "HOME":
+                self._page_to_start()
+                return
+            if key == "END":
+                self._page_to_end()
+                return
+
         if key == "ESC":
             if self.editor.text:
                 self.editor.clear()
