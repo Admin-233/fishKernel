@@ -545,9 +545,8 @@ class TuiApp:
         return changed
 
     # ---------------- 分栏翻页 ----------------
-    # 每次 PgUp/PgDn 翻多少行。固定 5 行，翻得慢一点更好跟读，
-    # 也不会把一条长消息一次跳过太多。
-    PAGE_STEP = 5
+    # 每次 PgUp/PgDn 翻多少行。固定 1 行，逐行阅读，不跳内容。
+    PAGE_STEP = 1
 
     def _page_step(self) -> int:
         return self.PAGE_STEP

@@ -521,7 +521,7 @@ def test_left_pane_preserves_newlines(archive, log):
     assert not any("第一行" in b and "第二行" in b for b in left_bodies), "多行被压成一行了"
 
 
-def test_page_step_is_five(archive):
-    """PgUp/PgDn 每次翻 5 行。"""
+def test_page_step_is_one(archive):
+    """PgUp/PgDn 每次翻 1 行，逐行阅读。"""
     app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=40)
-    assert app._page_step() == 5
+    assert app._page_step() == 1
