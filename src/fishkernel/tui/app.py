@@ -26,6 +26,7 @@ from .render import (
     Line,
     display_width,
     render_event,
+    truncate,
     render_frame,
     sanitize,
     status_line,
@@ -272,11 +273,14 @@ class TuiApp:
         recent = turns_all[start:end]
         for label, text in recent:
             one_line = " ".join(text.split())
-            clipped = one_line[: left_w - 2]
-            if len(one_line) > left_w - 2:
-                clipped += "…"
+            # 关键：必须按显示宽度裁，不能按字符数裁。
+            # 中文是全角（display_width=2），按字符数裁会让一个"40 字符"的
+            # 左栏文本实际占 80 格，直接把右栏挤出去造成两栏重叠。
+            prefix = f"{label}│"
+            body_w = max(4, left_w - display_width(prefix))
+            clipped = truncate(one_line, body_w)
             style = STYLE_USER if label == "你" else STYLE_ASSISTANT
-            left.append(Line(f"{label}│{clipped}", style))
+            left.append(Line(f"{prefix}{clipped}", style))
         left = left[-rows_n:]
 
         # ---- 右栏：完整记录里的最近若干条（工具调用/结果/思维链）----
@@ -288,10 +292,7 @@ class TuiApp:
             txt = " ".join(line.text.split())
             if not txt:
                 continue
-            clipped = txt[: right_w - 1]
-            if len(txt) > right_w - 1:
-                clipped += "…"
-            right.append(Line(clipped, line.style))
+            right.append(Line(truncate(txt, right_w), line.style))
         right = right[-rows_n:]
 
         # ---- 拼成两栏 ----
