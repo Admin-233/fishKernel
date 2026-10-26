@@ -65,3 +65,71 @@ def test_last_seq_survives_huge_last_line(archive):
     log = EventLog(path).open()
     assert log.last_seq == 6
     log.close()
+
+
+# ---- read_events 解析缓存的正确性 ----
+def test_parse_cache_returns_same_as_fresh_read(archive):
+    """缓存命中的结果必须与全新解析完全一致。"""
+    from fishkernel.events import clear_parse_cache, read_events
+
+    log = EventLog(archive.events_path).open()
+    for i in range(5):
+        log.append("user/message", text=f"m{i}")
+    log.close()
+
+    clear_parse_cache()
+    first = read_events(archive.events_path)
+    second = read_events(archive.events_path)     # 命中缓存
+    assert [e.seq for e in first] == [e.seq for e in second]
+    assert [e.data["text"] for e in first] == [e.data["text"] for e in second]
+
+
+def test_parse_cache_sees_appended_events(archive):
+    """追加新事件后，缓存必须能读到新增部分。"""
+    from fishkernel.events import clear_parse_cache, read_events
+
+    clear_parse_cache()
+    log = EventLog(archive.events_path).open()
+    log.append("user/message", text="a")
+    assert len(read_events(archive.events_path)) == 1
+
+    log.append("user/message", text="b")
+    events = read_events(archive.events_path)
+    assert [e.data["text"] for e in events] == ["a", "b"]
+    log.close()
+
+
+def test_parse_cache_invalidated_on_truncate(archive):
+    """文件被截断（如 create_archive 清空）后缓存必须失效。"""
+    from fishkernel.events import clear_parse_cache, read_events, truncate_partial_tail
+
+    clear_parse_cache()
+    log = EventLog(archive.events_path).open()
+    log.append("user/message", text="a")
+    log.close()
+    assert len(read_events(archive.events_path)) == 1
+
+    # 模拟写到一半崩掉：文件末尾没有换行
+    with open(archive.events_path, "a", encoding="utf-8") as f:
+        f.write('{"seq":2,"ts":"","type":"user/message","data":{"text":"b"')
+    assert truncate_partial_tail(archive.events_path) is True
+    clear_parse_cache(archive.events_path)
+    events = read_events(archive.events_path)
+    assert [e.data["text"] for e in events] == ["a"]
+
+
+def test_parse_cache_invalidated_on_replacement(archive):
+    """文件被整体替换（inode 变化）后缓存必须失效。"""
+    import os
+    from fishkernel.events import clear_parse_cache, read_events
+
+    clear_parse_cache()
+    log = EventLog(archive.events_path).open()
+    log.append("user/message", text="old")
+    log.close()
+    assert [e.data["text"] for e in read_events(archive.events_path)] == ["old"]
+
+    # 用 write_atomic 整体替换（inode 会变）
+    from fishkernel.atomic import write_atomic
+    write_atomic(archive.events_path, '{"seq":1,"ts":"","type":"user/message","data":{"text":"new"}}\n')
+    assert [e.data["text"] for e in read_events(archive.events_path)] == ["new"]

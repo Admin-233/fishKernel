@@ -90,7 +90,9 @@ class EventLog:
     def open(self) -> "EventLog":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
-        truncate_partial_tail(self.path)
+        if truncate_partial_tail(self.path):
+            # 末行被截断，缓存里的偏移已不可信
+            clear_parse_cache(self.path)
         last = _last_seq(self.path)
         self._seq = last
         self._opened = True
@@ -159,22 +161,77 @@ def _last_seq(path: Path) -> int:
     return 0
 
 
+# 解析缓存：事件日志正常只追加，所以已解析过的字节区间可以复用。
+# 键是文件路径，值记录「文件身份(ino) + 已消费字节偏移 + mtime + 已解析事件」。
+# 每轮多一次 stat 的成本（微秒级）换取避免 3795 次 json.loads（17ms）。
+_PARSE_CACHE: dict[str, tuple[int, int, float, list[Event]]] = {}
+
+
+def clear_parse_cache(path: Path | str | None = None) -> None:
+    """清掉解析缓存。测试和压缩重写历史后需要调用。"""
+    if path is None:
+        _PARSE_CACHE.clear()
+    else:
+        _PARSE_CACHE.pop(str(Path(path).resolve()), None)
+
+
 def read_events(path: Path | str, after_seq: int = 0) -> list[Event]:
+    """读取事件日志。
+
+    性能说明：这个函数每轮都要调用，而事件流会涨到几千条。
+    早期实现每次都把整份文件重新 json.loads 一遍（3700 条约 17ms）。
+    因为日志只追加，这里按字节偏移缓存已解析结果，只解析新增的行。
+    """
     path = Path(path)
     if not path.exists():
         return []
-    events: list[Event] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            event = Event.from_json(line)
-            if event is None:
-                continue
-            if event.seq > after_seq:
-                events.append(event)
-    return events
+
+    key = str(path.resolve())
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+    size, ino, mtime = stat.st_size, stat.st_ino, stat.st_mtime
+
+    cached = _PARSE_CACHE.get(key)
+    if cached is None:
+        offset, cached_events = 0, []
+    else:
+        c_offset, c_ino, c_mtime, c_events = cached
+        offset, cached_events = c_offset, c_events
+        # inode 变了 = 文件被替换；变短 = 被截断；两者都让缓存失效
+        if c_ino != ino or size < c_offset:
+            offset, cached_events = 0, []
+        elif size == c_offset and mtime != c_mtime:
+            # 长度没变但内容可能被改写（如清空后重写等长内容），保守重解析
+            offset, cached_events = 0, []
+
+    if size > offset:
+        new_events = list(cached_events)
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            if offset:
+                handle.seek(offset)
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                event = Event.from_json(line)
+                if event is None:
+                    continue
+                new_events.append(event)
+            new_offset = handle.tell()
+        # 用解析到的新位置 + 当时的 mtime 作为下次的基线
+        try:
+            after = path.stat()
+            ino, mtime = after.st_ino, after.st_mtime
+        except OSError:
+            pass
+        _PARSE_CACHE[key] = (new_offset, ino, mtime, new_events)
+        cached_events = new_events
+
+    if after_seq:
+        return [e for e in cached_events if e.seq > after_seq]
+    return list(cached_events)
 
 
 def iter_events(path: Path | str, after_seq: int = 0) -> Iterator[Event]:

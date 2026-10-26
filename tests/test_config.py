@@ -28,8 +28,20 @@ def test_config_defaults_and_budget():
     assert config.model == "deepseek-flash"
     assert config.max_tokens == 8192
     assert config.spec.context_window == 1_048_576
-    assert config.budget.threshold == 838_860
-    assert config.budget.retain == 166_461
+    # 阈值按公式推导，不写死数字：改 COMPACT_THRESHOLD_RATIO 时测试不该误报
+    from fishkernel.constants import (
+        COMPACT_HEADROOM_TOKENS,
+        COMPACT_RETAIN_RATIO,
+        COMPACT_THRESHOLD_RATIO,
+    )
+    import math
+
+    w = config.spec.context_window
+    o = config.max_tokens
+    assert config.budget.threshold == math.floor(
+        min(w * COMPACT_THRESHOLD_RATIO, w - o - COMPACT_HEADROOM_TOKENS)
+    )
+    assert config.budget.retain == math.floor(COMPACT_RETAIN_RATIO * (w - o))
 
 
 def test_config_rejects_unknown_model():

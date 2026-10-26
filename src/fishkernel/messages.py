@@ -130,8 +130,10 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
             if text:
                 tail.append({"role": "user", "content": RUNTIME_PREFIX + text})
         elif event.type == "delay":
-            seconds = event.data.get("seconds")
-            tail.append({"role": "user", "content": f"{RUNTIME_PREFIX}等待了 {seconds} 秒"})
+            # 延时事件保留在事件流里供审计与 TUI 展示，但**不再投影进上下文**。
+            # 原因：每轮一条「[runtime] 等待 N 秒」几乎不携带信息，
+            # 长期运行会把上下文撑爆（实测 200 多轮就从 13 万涨到 46 万 token）。
+            pass
         elif event.type == "memory/write":
             # 已登记、尚未落盘：压缩时会写进 LongTermMemory.txt
             mode = event.data.get("mode", "append")

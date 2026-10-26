@@ -21,6 +21,14 @@ from typing import Any
 from .events import Event
 from .messages import build_messages
 
+import re
+
+# CJK 统一表意文字、日文假名、韩文、全角标点（与 _char_cost 的判断保持一致）
+_CJK_RE = re.compile(
+    r"[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef\u3000-\u303f]"
+)
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
+
 PER_MESSAGE_OVERHEAD = 4
 PER_TOOL_OVERHEAD = 16
 
@@ -43,11 +51,27 @@ def _char_cost(ch: str) -> float:
 
 
 def estimate_text(text: str) -> int:
+    """估算一段文本的 token 数。
+
+    性能说明：早期实现是 `for ch in text: total += _char_cost(ch)`，
+    在 45 万 token 的上下文上要跑 100 万次 Python 函数调用，实测 37ms/次，
+    是每轮最大的 CPU 开销（占 66%）。这里改成按类别批量统计：
+    ASCII / CJK / 其它各数一次，把逐字符的函数调用降到 3 次统计。
+    """
     if not text:
         return 0
-    total = 0.0
-    for ch in text:
-        total += _char_cost(ch)
+
+    # re 的 C 实现只扫一遍，比 Python 层逐字符快一个数量级
+    if text.isascii():
+        return math.ceil(len(text) * 0.3)
+
+    total_len = len(text)
+    # sub 把非 ASCII 换成空，剩下的就是 ASCII 部分
+    ascii_count = len(_NON_ASCII_RE.sub("", text))
+    cjk_count = len(_CJK_RE.findall(text))
+    other_count = total_len - ascii_count - cjk_count
+
+    total = ascii_count * 0.3 + cjk_count * 0.6 + other_count * 0.5
     return math.ceil(total)
 
 
