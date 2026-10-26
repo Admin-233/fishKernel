@@ -273,16 +273,32 @@ class TuiApp:
         start = max(0, end - rows_n)
         recent = turns_all[start:end]
         for label, text in recent:
-            one_line = " ".join(text.split())
-            # 左栏不省略：按显示宽度**折行**，把整段话铺开成多行。
-            # 注意必须按 display_width 切（中文全角=2），按字符数切会溢出。
+            # 保留原文的换行结构：逐行处理，只在行内折叠多余空白。
+            # 之前用 " ".join(text.split()) 会把换行全压成空格，
+            # 用户的段落、我的列表全挤成一整行，这是"换行显示不对"的根因。
+            raw_lines = [ln.rstrip() for ln in str(text).splitlines()]
+            while raw_lines and not raw_lines[0].strip():
+                raw_lines.pop(0)
+            while raw_lines and not raw_lines[-1].strip():
+                raw_lines.pop()
+
             prefix = f"{label}│"
             body_w = max(4, left_w - display_width(prefix))
-            segments = wrap_text(one_line, body_w)
+            indent = " " * display_width(prefix)
             style = STYLE_USER if label == "你" else STYLE_ASSISTANT
+
+            segments: list[str] = []
+            for raw in raw_lines:
+                line_text = " ".join(raw.split())
+                if not line_text:
+                    segments.append("")          # 原文的段落间隙保留成空行
+                else:
+                    segments.extend(wrap_text(line_text, body_w))
+
+            if not segments:
+                segments = [""]
             for idx, seg in enumerate(segments):
-                # 第一行带「你│」「我│」前缀，续行缩进对齐，便于区分条目
-                head = prefix if idx == 0 else " " * display_width(prefix)
+                head = prefix if idx == 0 else indent
                 left.append(Line(f"{head}{seg}", style))
         left = left[-rows_n:]
 
@@ -529,10 +545,12 @@ class TuiApp:
         return changed
 
     # ---------------- 分栏翻页 ----------------
+    # 每次 PgUp/PgDn 翻多少行。固定 5 行，翻得慢一点更好跟读，
+    # 也不会把一条长消息一次跳过太多。
+    PAGE_STEP = 5
+
     def _page_step(self) -> int:
-        """一页翻多少：取当前消息区可见行数的一半，避免一次翻过头。"""
-        body = max(1, self._cur_height - 4)
-        return max(1, body // 2)
+        return self.PAGE_STEP
 
     def _page_by(self, delta: int) -> None:
         """delta > 0 往回翻（更旧），delta < 0 往前翻（更新）。"""

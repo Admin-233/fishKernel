@@ -486,3 +486,42 @@ def test_wrapped_rows_fit_pane_width(archive, log):
         if "│" in row:
             left = row.split("│", 1)[0]
             assert display_width(left) <= left_w, f"左栏行超宽 {display_width(left)} > {left_w}"
+
+
+def test_left_pane_preserves_newlines(archive, log):
+    """左栏必须保留原文的换行结构，不能把多行压成一行。"""
+    log.append(
+        "user/message",
+        source="control",
+        text="第一行\n第二行\n\n第四行（前面有空行）\n- 列表一\n- 列表二",
+    )
+    # 高度要够：消息区 = height - 4，要装下 6 行内容
+    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=40)
+    app._ensure_primed()
+
+    # 左栏宽度 = CHAT_SPLIT * width - 1，用固定列宽切，避免与「你│」前缀混淆
+    left_w = max(20, int(100 * app.CHAT_SPLIT) - 1)
+    left_bodies = []
+    for row in app._snapshot_frame().split("\r\n")[1:]:
+        if not row.strip():
+            continue
+        body = row[:left_w].rstrip()
+        # 去掉「你│」「我│」「系统│」这类前缀，保留正文
+        for pfx in ("你│", "我│", "系统│"):
+            if body.startswith(pfx):
+                body = body[len(pfx):]
+                break
+        left_bodies.append(body.strip())
+
+    text = "\n".join(left_bodies)
+    # 每一行都应独立出现
+    for expected in ["第一行", "第二行", "第四行", "- 列表一", "- 列表二"]:
+        assert expected in text, f"换行被吃掉，找不到 {expected!r}"
+    # 关键：内容不能全挤在同一行
+    assert not any("第一行" in b and "第二行" in b for b in left_bodies), "多行被压成一行了"
+
+
+def test_page_step_is_five(archive):
+    """PgUp/PgDn 每次翻 5 行。"""
+    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=40)
+    assert app._page_step() == 5
