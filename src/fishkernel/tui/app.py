@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import queue
 import signal
@@ -23,6 +24,7 @@ from .render import (
     STYLE_DIM,
     STYLE_HINT,
     Line,
+    display_width,
     render_event,
     render_frame,
     sanitize,
@@ -197,7 +199,8 @@ class TuiApp:
 
     # ---------------- 渲染 ----------------
     # ---------------- 置顶聊天区 ----------------
-    CHAT_ROWS = 6          # 钉在顶部显示几行
+    CHAT_ROWS = 8          # 顶部分栏区高度（行）
+    CHAT_SPLIT = 0.42      # 左栏（人机对话）占宽度的比例，其余给右栏（完整记录）
     CHAT_MAX_WIDTH = 68    # 单行最长多少字符，避免撑爆
 
     def _refresh_chat(self) -> None:
@@ -218,20 +221,75 @@ class TuiApp:
                 text = str(event.data.get("text", "")).strip()
                 if text:
                     turns.append(("我", text))
+
         self._chat_turns = turns
+        # 右栏：完整记录（工具调用 / 工具结果 / 思维链）。
+        # 只取「过程类」事件，对话正文已经由左栏承担，避免两边重复。
+        detail: list[Line] = []
+        total = len(self.events)
+        recent_events = list(itertools.islice(self.events, max(0, total - 300), total))
+        for event in recent_events:
+            if event.type in {"user/message", "delay", "turn/start", "turn/end",
+                              "session/start", "session/end"}:
+                continue
+            lines = render_event(event, 200)
+            if event.type == "tool/result":
+                # 工具输出常常几十行，右栏只需要「调用了什么、成功没有」，
+                # 全文留给下方的事件流区。
+                data = event.data
+                ok = "✓" if data.get("ok") else "✗"
+                out_len = len(str(data.get("output", "")))
+                detail.append(Line(f"  {ok} {data.get('name','?')} · {out_len} 字符", STYLE_DIM))
+                continue
+            detail.extend(lines)
+        self._detail_lines = detail
 
     def _chat_lines(self, width: int) -> list[Line]:
-        rows: list[Line] = []
-        limit = max(10, min(width, self.CHAT_MAX_WIDTH))
-        recent = getattr(self, "_chat_turns", [])[-3:]   # 最近 3 轮足够
+        """构造顶部分栏区：左边是「人机对话」，右边是「完整记录（含思维链）」。
+
+        左边的信息密度低但最重要（我说了什么、你说了什么）；
+        右边的信息密度高（工具调用、工具输出、思维链），并且变化快。
+        分成两栏后，左侧不会被工具刷屏冲掉。
+        """
+        left_w = max(20, int(width * self.CHAT_SPLIT) - 1)
+        right_w = max(10, width - left_w - 1)
+        rows_n = self.CHAT_ROWS
+
+        # ---- 左栏：最近几轮人机对话 ----
+        left: list[Line] = []
+        recent = getattr(self, "_chat_turns", [])[-4:]
         for label, text in recent:
             one_line = " ".join(text.split())
-            clipped = one_line[: limit - 2]
-            if len(one_line) > limit - 2:
+            clipped = one_line[: left_w - 2]
+            if len(one_line) > left_w - 2:
                 clipped += "…"
-            style = STYLE_USER if label in {"你"} else STYLE_ASSISTANT
-            rows.append(Line(f"{label}│{clipped}", style))
-        return rows[-self.CHAT_ROWS :]
+            style = STYLE_USER if label == "你" else STYLE_ASSISTANT
+            left.append(Line(f"{label}│{clipped}", style))
+        left = left[-rows_n:]
+
+        # ---- 右栏：完整记录里的最近若干条（工具调用/结果/思维链）----
+        right: list[Line] = []
+        for line in reversed(getattr(self, "_detail_lines", [])):
+            txt = " ".join(line.text.split())
+            if not txt:
+                continue
+            clipped = txt[: right_w - 1]
+            if len(txt) > right_w - 1:
+                clipped += "…"
+            right.append(Line(clipped, line.style))
+            if len(right) >= rows_n:
+                break
+        right.reverse()
+
+        # ---- 拼成两栏 ----
+        out: list[Line] = []
+        for i in range(rows_n):
+            l = left[i].text if i < len(left) else ""
+            r = right[i].text if i < len(right) else ""
+            pad = " " * max(0, left_w - display_width(l))
+            style = left[i].style if i < len(left) else STYLE_DIM
+            out.append(Line(f"{l}{pad}│{r}", style))
+        return out
 
     def _rebuild(self, width: int) -> None:  # noqa: D401
         self._refresh_chat()
