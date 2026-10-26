@@ -37,6 +37,36 @@ def _tool_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
     return calls
 
 
+# 上下文里最多保留多少张「真图」。更早的降级成占位符。
+# 一张 1024x768 的图约 1000~2000 token，留太多会挤占对话空间。
+MAX_LIVE_IMAGES = 4
+
+
+def images_path_of(event: Event) -> str:
+    """从 tool/result 事件里取图片路径，用于占位符提示。"""
+    images = event.data.get("images") or []
+    if images and isinstance(images[0], dict):
+        return str(images[0].get("path", "?"))
+    return "?"
+
+
+def image_keep_floor(events: list[Event], keep: int = MAX_LIVE_IMAGES) -> int:
+    """返回「真图保留区」的起点 seq：seq >= 该值的事件里图片才真正带上。
+
+    从后往前数带图的事件，第 keep 张图的 seq 即为分界线；
+    图片总数不超过 keep 时返回 0，表示一张都不卸载。
+    """
+    seqs = [e.seq for e in events if e.type == "tool/result" and (e.data.get("images") or [])]
+    if len(seqs) <= keep:
+        return 0
+    return seqs[-keep]
+
+
+def _image_is_offloaded(event: Event, keep_seq: int) -> bool:
+    """该事件的图片是否应被卸载（只剩占位符）。"""
+    return keep_seq > 0 and event.seq < keep_seq
+
+
 def _unknown_outcome(call: dict[str, Any]) -> str:
     return json.dumps(
         {
@@ -58,6 +88,8 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
     - assistant 的 tool_calls 必须配齐 tool 结果；缺失时补 TOOL_OUTCOME_UNKNOWN。
     """
     head: list[dict[str, Any]] = [{"role": "system", "content": system_text}]
+    # 只保留最近 MAX_LIVE_IMAGES 张真图，更早的降级成占位符（见 image_keep_floor）
+    keep_seq = image_keep_floor(events)
     start = find_last_summary_index(events)
 
     if start >= 0:
@@ -112,13 +144,51 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
                             }
                         )
                     else:
-                        tail.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call["id"],
-                                "content": str(result_event.data.get("output", "")),
-                            }
-                        )
+                        output = str(result_event.data.get("output", ""))
+                        images = result_event.data.get("images") or []
+                        if images and _image_is_offloaded(result_event, keep_seq):
+                            # 历史图片降级：一张图动辄上千 token，全留着会撑爆上下文。
+                            # 参照 dsh 的 image-offload：只保留最近 keep 张真图，
+                            # 更早的换成一行占位符，模型仍知道"这里曾有张图"。
+                            images = []
+                            output = (
+                                output.rstrip()
+                                + '\n[image offloaded: 历史图片已卸载，'
+                                + f'路径 {images_path_of(result_event)}，需要时再 read_file 一次]'
+                            )
+                        if images:
+                            # 带图片的工具结果：文本部分照常给，图片用 image 块附在
+                            # 紧随其后的 user 消息里（tool 角色只接受字符串内容）。
+                            tail.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call["id"],
+                                    "content": output,
+                                }
+                            )
+                            blocks: list[dict[str, Any]] = [
+                                {
+                                    "type": "text",
+                                    "text": f"（以上是 read_file 对图片 {images[0].get('path', '')} 的说明，图片本身在下面）",
+                                }
+                            ]
+                            for img in images:
+                                url = img.get("url")
+                                if not url:
+                                    continue
+                                blocks.append(
+                                    {"type": "image_url", "image_url": {"url": url}}
+                                )
+                            if len(blocks) > 1:
+                                tail.append({"role": "user", "content": blocks})
+                        else:
+                            tail.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call["id"],
+                                    "content": output,
+                                }
+                            )
                 index = cursor
                 continue
             tail.append(message)

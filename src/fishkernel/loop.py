@@ -308,6 +308,7 @@ class Kernel:
                 output=result.text,
                 job_id=result.job_id,
                 duration_ms=result.duration_ms,
+                **({"images": result.images} if result.images else {}),
             )
             self.archive.append_history(self._tool_history_line(call.name, result.ok, result.text))
             self.logger.info(f"工具 {call.name} → {'成功' if result.ok else '失败'}（{result.duration_ms}ms）")

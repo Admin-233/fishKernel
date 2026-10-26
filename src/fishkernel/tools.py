@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -35,7 +36,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取文本文件，按行分段。大文件请用 offset/limit 逐段读，不要一次读完整份。",
+            "description": "读取文件，按行分段。文本文件请用 offset/limit 逐段读；图片（png/jpeg/gif/webp）会作为图像附上，你可以直接看，不需要 offset/limit。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -174,6 +175,8 @@ class ToolResult:
     name: str = ""
     call_id: str = ""
     spill_dir: Path | None = None
+    # 图片附件：read_file 读到图片时填，投影时变成 image 块交给模型看
+    images: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -224,6 +227,28 @@ def _shrink(value: Any, spill_dir: Path | None, name: str) -> Any:
     return value
 
 
+# ---- 图片识别 ----
+# 只接受模型明确支持的四种格式（API 报错信息里列的就是这四个）
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+)
+MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 单张上限 8MB，超出转文本说明
+
+
+def _sniff_image(head: bytes) -> str | None:
+    """按文件头判断图片类型，不认识就返回 None。"""
+    for magic, kind in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return kind
+    # WebP: RIFF....WEBP
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
 class ToolBox:
     def __init__(self, archive: Archive, jobs: JobManager, control: Control, events=None):
         self.archive = archive
@@ -243,8 +268,21 @@ class ToolBox:
             handler: Callable[[dict[str, Any]], dict[str, Any]] = getattr(self, f"_tool_{name}", None)  # type: ignore[assignment]
             if handler is None:
                 raise _ToolError("unknown_tool", f"没有名为 {name} 的工具")
+            # 注意：handler 返回的 __images__ 会在下方被摘出，见 _finish_result
             payload = handler(args)
-            result = ToolResult(ok=True, payload=payload, name=name, call_id=call_id, spill_dir=self.archive.spill_dir)
+            # 图片附件从 payload 里摘出来单独携带：base64 有几 MB，
+            # 留在 JSON 文本里会瞬间吃满上下文，而且模型也不需要看 base64。
+            images = payload.pop("__images__", None) or []
+            # payload 自己带 ok=False 时（如 image_too_large），整体也算失败
+            ok_flag = payload.get("ok", True)
+            result = ToolResult(
+                ok=bool(ok_flag),
+                payload=payload,
+                name=name,
+                call_id=call_id,
+                spill_dir=self.archive.spill_dir,
+                images=images,
+            )
             if isinstance(payload.get("job_id"), str):
                 result.job_id = payload["job_id"]
         except _ToolError as exc:
@@ -287,6 +325,40 @@ class ToolBox:
         if not path.is_absolute():
             path = self.archive.root / path
         return path.resolve()
+
+    def _read_image(self, path: Path, kind: str, head: bytes) -> ToolResult:
+        """把图片读成 base64，作为 image 块交给模型看。
+
+        返回值里带一个 images 字段，messages 投影时会把它塞进场内容的 image block。
+        同时给出文字摘要，方便模型在不支持图片的场合也知道"这里有一张图"。
+        """
+        size = path.stat().st_size
+        if size > MAX_IMAGE_BYTES:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "image_too_large",
+                    "message": f"图片 {size} 字节，超过上限 {MAX_IMAGE_BYTES}，未传给模型",
+                },
+                "path": str(path),
+            }
+
+        data = path.read_bytes()
+        b64 = base64.b64encode(data).decode("ascii")
+        mime = "jpeg" if kind == "jpeg" else kind
+        # 用 data URL，DeepSeek 接受这种形式（实测通过）
+        url = f"data:image/{mime};base64,{b64}"
+        # 图片本体放在 __images__ 里，dispatch 会把它摘出来放进 ToolResult.images，
+        # 不留在给模型看的 JSON 文本里（否则 base64 会污染上下文）。
+        return {
+            "ok": True,
+            "kind": "image",
+            "path": str(path),
+            "format": kind,
+            "size": size,
+            "note": "图片已附上，你可以直接看。",
+            "__images__": [{"url": url, "path": str(path), "format": kind}],
+        }
 
     def _spill_remainder(self, path: Path, position: int) -> dict[str, Any]:
         """把文件从 position 起的剩余内容写入 spill，返回定位信息。"""
@@ -338,6 +410,12 @@ class ToolBox:
                 head = handle.read(8192)
         except OSError as exc:
             raise _ToolError("io_error", f"读取失败：{exc}") from None
+        # 图片不是"读不了的二进制"，而是可以直接交给模型看的内容。
+        # deepseek-flash 的 input_modalities 含 image，内核只要把图片块传上去即可。
+        image_kind = _sniff_image(head)
+        if image_kind is not None:
+            return self._read_image(path, image_kind, head)
+
         if b"\x00" in head:
             raise _ToolError("binary_file", f"{path} 看起来是二进制文件")
 
