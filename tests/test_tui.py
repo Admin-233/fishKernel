@@ -405,3 +405,33 @@ def test_paging_clamped_at_boundaries(archive, log):
     for _ in range(100):
         app._handle_key("PGDN")
     assert app._left_page == 0
+
+
+def test_poll_refreshes_split_panes(archive, log):
+    """新事件到达后，左右两栏必须跟着更新，不能停在启动那一刻。"""
+    log.append("user/message", text="第一条", source="control")
+    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=20)
+    app._ensure_primed()
+    assert len(app._chat_turns) == 1
+
+    log.append("assistant/message", text="回复")
+    assert app._poll() is True, "有新事件时必须返回 changed=True"
+    assert len(app._chat_turns) == 2, "左栏应包含新增的助手回复"
+    assert app._chat_turns[-1] == ("我", "回复")
+
+    log.append("user/message", text="又问", source="control")
+    app._poll()
+    assert len(app._chat_turns) == 3
+    assert app._chat_turns[-1] == ("你", "又问")
+
+
+def test_poll_keeps_right_pane_in_sync(archive, log):
+    """右栏（过程记录）也要跟着刷新。"""
+    log.append("user/message", text="hi", source="control")
+    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=20)
+    app._ensure_primed()
+    before = len(app._detail_lines)
+
+    log.append("tool/result", call_id="c1", name="list_dir", ok=True, output="{}")
+    app._poll()
+    assert len(app._detail_lines) > before, "工具结果应出现在右栏"

@@ -492,6 +492,13 @@ class TuiApp:
                         self._pressure = pressure
             for event in events:
                 new_lines.extend(render_event(event, self._cur_width))
+            if events:
+                # 关键：分栏数据必须跟着事件刷新。
+                # 之前只把事件塞进 feed（下方事件流），_chat_turns / _detail_lines
+                # 停在启动那一刻，所以左右两栏看起来"不实时"。
+                self._refresh_chat()
+                # 有事件就必须重绘，否则新内容要等到下一次状态栏刷新才出现
+                changed = True
             if new_lines:
                 self.feed.append(new_lines)
                 if self.scroll > 0:
