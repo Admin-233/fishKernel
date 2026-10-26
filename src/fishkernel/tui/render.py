@@ -358,12 +358,16 @@ def render_frame(
     height = max(6, height)
     chat_rows = list(chat or [])
     # 状态(1) + 分隔(1) + 输入(1) + 提示(1) = 4 行固定开销
-    feed_height = max(1, height - 4 - len(chat_rows))
+    feed_height = max(1, height - 4)
     rows: list[Line] = [status]
-    rows.extend(chat_rows)
-    visible = feed[-feed_height:]
-    rows.extend(visible)
-    while len(rows) < 1 + len(chat_rows) + feed_height:
+
+    if chat_rows:
+        # 左右分屏：chat 行本身已含「左 │ 右」，占满整个消息区
+        rows.extend(chat_rows[:feed_height])
+    else:
+        rows.extend(feed[-feed_height:])
+
+    while len(rows) < 1 + feed_height:
         rows.append(Line(""))
     rows.append(Line("─" * width, STYLE_DIM))
     rows.append(Line("> " + input_text, STYLE_INPUT))

@@ -199,8 +199,8 @@ class TuiApp:
 
     # ---------------- 渲染 ----------------
     # ---------------- 置顶聊天区 ----------------
-    CHAT_ROWS = 8          # 顶部分栏区高度（行）
     CHAT_SPLIT = 0.42      # 左栏（人机对话）占宽度的比例，其余给右栏（完整记录）
+    CHAT_ROWS = 0          # 运行时按终端高度计算，0 表示「占满消息区」
     CHAT_MAX_WIDTH = 68    # 单行最长多少字符，避免撑爆
 
     def _refresh_chat(self) -> None:
@@ -244,7 +244,7 @@ class TuiApp:
             detail.extend(lines)
         self._detail_lines = detail
 
-    def _chat_lines(self, width: int) -> list[Line]:
+    def _chat_lines(self, width: int, height: int | None = None) -> list[Line]:
         """构造顶部分栏区：左边是「人机对话」，右边是「完整记录（含思维链）」。
 
         左边的信息密度低但最重要（我说了什么、你说了什么）；
@@ -253,7 +253,8 @@ class TuiApp:
         """
         left_w = max(20, int(width * self.CHAT_SPLIT) - 1)
         right_w = max(10, width - left_w - 1)
-        rows_n = self.CHAT_ROWS
+        # 占满消息区：高度 - 状态(1) - 分隔(1) - 输入(1) - 提示(1)
+        rows_n = height if height and height > 0 else self.CHAT_ROWS or 8
 
         # ---- 左栏：最近几轮人机对话 ----
         left: list[Line] = []
@@ -348,9 +349,9 @@ class TuiApp:
     def _snapshot_frame(self) -> str:
         self._ensure_primed()
         self._rebuild(self._cur_width)
-        chat = self._chat_lines(self._cur_width)
-        feed_height = max(1, self._cur_height - 4 - len(chat))
-        feed = self.feed.visible(feed_height, 0)
+        body_h = max(1, self._cur_height - 4)
+        chat = self._chat_lines(self._cur_width, body_h)
+        feed = []
         hint = Line("快照模式 · 去掉 --snapshot 进入交互界面", STYLE_HINT)
         frame, _, _ = render_frame(
             width=self._cur_width,
@@ -445,17 +446,18 @@ class TuiApp:
 
     def _draw(self, term: Terminal) -> None:
         width, height = self._cur_width, self._cur_height
-        feed_height = max(1, height - 4 - len(self._chat_lines(width)))
+        # 整个消息区左右分屏：chat 自己占满高度，下方事件流不再单独显示
+        body_h = max(1, height - 4)
         frame, row, column = render_frame(
             width=width,
             height=height,
             status=self._status(width),
-            feed=self.feed.visible(feed_height, self.scroll),
+            feed=[],
             input_text=self.editor.text,
             cursor=self.editor.cursor,
             hint=self._hint(),
             color=self.color,
-            chat=self._chat_lines(width),
+            chat=self._chat_lines(width, body_h),
         )
         term.write(f"\x1b[?25l\x1b[H{frame}\x1b[{row};{column}H\x1b[?25h")
 

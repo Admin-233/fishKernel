@@ -250,8 +250,12 @@ def test_snapshot_frame_renders_events(archive, log):
     assert all(display_width(line) == 80 for line in lines)
     assert "fishKernel" in lines[0]
     joined = "\n".join(lines)
+    # 左栏：人机对话
     assert "你好" in joined
+    # 右栏：过程记录（工具调用摘要）
     assert "list_dir" in joined
+    # 左右分栏的分隔符
+    assert any("│" in line for line in lines)
 
 
 def test_submit_writes_inbox_and_commands(archive):
@@ -330,7 +334,8 @@ def test_render_frame_pins_chat_rows():
     assert rows[0].strip() == "STATUS"
     assert rows[1].strip() == "你│你好"
     assert rows[2].strip() == "我│在的"
-    assert "feed-1" in "\n".join(rows[3:])
+    # 分栏占满整个消息区，feed 不再单独渲染（内容由右栏承担）
+    assert "feed-1" not in "\n".join(rows)
 
 
 def test_chat_area_excludes_tool_noise():
