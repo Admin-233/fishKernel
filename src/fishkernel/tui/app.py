@@ -27,6 +27,7 @@ from .render import (
     display_width,
     render_event,
     truncate,
+    wrap_text,
     render_frame,
     sanitize,
     status_line,
@@ -273,14 +274,16 @@ class TuiApp:
         recent = turns_all[start:end]
         for label, text in recent:
             one_line = " ".join(text.split())
-            # 关键：必须按显示宽度裁，不能按字符数裁。
-            # 中文是全角（display_width=2），按字符数裁会让一个"40 字符"的
-            # 左栏文本实际占 80 格，直接把右栏挤出去造成两栏重叠。
+            # 左栏不省略：按显示宽度**折行**，把整段话铺开成多行。
+            # 注意必须按 display_width 切（中文全角=2），按字符数切会溢出。
             prefix = f"{label}│"
             body_w = max(4, left_w - display_width(prefix))
-            clipped = truncate(one_line, body_w)
+            segments = wrap_text(one_line, body_w)
             style = STYLE_USER if label == "你" else STYLE_ASSISTANT
-            left.append(Line(f"{prefix}{clipped}", style))
+            for idx, seg in enumerate(segments):
+                # 第一行带「你│」「我│」前缀，续行缩进对齐，便于区分条目
+                head = prefix if idx == 0 else " " * display_width(prefix)
+                left.append(Line(f"{head}{seg}", style))
         left = left[-rows_n:]
 
         # ---- 右栏：完整记录里的最近若干条（工具调用/结果/思维链）----

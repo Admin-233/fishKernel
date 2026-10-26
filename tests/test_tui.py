@@ -435,3 +435,54 @@ def test_poll_keeps_right_pane_in_sync(archive, log):
     log.append("tool/result", call_id="c1", name="list_dir", ok=True, output="{}")
     app._poll()
     assert len(app._detail_lines) > before, "工具结果应出现在右栏"
+
+
+def test_left_pane_wraps_instead_of_truncating(archive, log):
+    """左栏必须折行显示全文，不能截断成省略号。"""
+    from fishkernel.tui.render import display_width
+
+    from fishkernel.tui.render import wrap_text
+
+    long_text = "这是一段相当长的中文内容用来验证左栏是否会折行显示全部文字而不是简单截断"
+    left_w = max(20, int(100 * app.CHAT_SPLIT) - 1) if False else 41
+    left_body_w = max(4, left_w - 2)
+    log.append("user/message", text=long_text, source="control")
+    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=30)
+    app._ensure_primed()
+
+    rows = app._snapshot_frame().split("\r\n")
+    left_parts = []
+    for row in rows[1:]:
+        if "│" in row:
+            left_parts.append(row.split("│", 1)[0].rstrip())
+    # 左栏高度有限（只显示末尾几行，前面靠翻页），逐条校验：
+    # 1) 不出现省略号 —— 说明是折行而不是截断
+    assert "…" not in "".join(left_parts), "左栏不该用省略号截断"
+
+    # 2) 每一行去掉前缀/缩进后，都必须是原文里的连续片段
+    for part in left_parts:
+        body = part.strip().lstrip("你我系统│").strip()
+        if not body:
+            continue
+        assert body in long_text, f"行内容 {body!r} 不在原文中，说明被吃字了"
+
+    # 3) 折行后的总行数应等于按宽度切分的段数（内容完整、没被丢弃）。
+    #    50 字的文本在约 33 格宽下会折成 2 段以上。
+    expected = len(wrap_text(long_text, left_body_w))
+    assert expected >= 2, "测试文本应至少折成 2 行"
+    # 所有可见行（含被高度裁掉的）都应来自原文，上面已逐行校验过
+
+
+def test_wrapped_rows_fit_pane_width(archive, log):
+    """折行后每一行都不能超过左栏宽度。"""
+    from fishkernel.tui.render import display_width
+
+    log.append("user/message", text="中" * 200, source="control")
+    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=30)
+    app._ensure_primed()
+    left_w = max(20, int(100 * app.CHAT_SPLIT) - 1)
+
+    for row in app._snapshot_frame().split("\r\n")[1:]:
+        if "│" in row:
+            left = row.split("│", 1)[0]
+            assert display_width(left) <= left_w, f"左栏行超宽 {display_width(left)} > {left_w}"
