@@ -1,3 +1,23 @@
+## v0.4.1
+
+- 修复 `jobs.tick()` 的超时判定在非 +0800 机器上失效：
+
+  ```python
+  started = time.mktime(time.strptime(job.started_at, "%Y-%m-%dT%H:%M:%S%z"))
+  ```
+
+  `%z` 只让 `strptime` 认出偏移，`mktime` 却一律按**进程所在时区**解释那串 wall clock，
+  tzinfo 被静默丢掉。本机时区恰好是 +0800，所以测试全绿；换到 UTC 的服务器上，
+  每个任务的起始时刻都被算成 8 小时后 → 超时**永远不触发**（负偏移的机器上则会立刻误杀）。
+  改为 `datetime.strptime(..., %z).timestamp()`，保留 tzinfo；解析失败返回 `None`，
+  此时宁可让任务继续跑也不误杀。
+
+- 新增 4 项回归测试，全部在真实切换 `TZ` 下运行（`Asia/Shanghai` / `UTC` / `America/New_York`）：
+  同一时刻的不同写法必须解析成同一时间戳；刚启动的任务不得被判超时；真正过期的任务必须照杀。
+  已用「临时还原 bug」验证过这些测试确实会失败。
+
+- 174 -> 178 passed。
+
 ## v0.4.0
 
 - 新增 `fishkernel web`：零依赖（stdlib `http.server`）网页控制台。事件流增量拉取、任务列表、暂停/继续/唤醒/交班重启/停止、发消息；与 TUI 同一套边界——只读事件日志、只写控制文件，不碰内核进程和锁。默认只监听 `127.0.0.1`，可用 `--host` / `--token` 开放。

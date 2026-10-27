@@ -15,6 +15,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from .archive import Archive
@@ -24,6 +25,25 @@ from .constants import JOBS_KEEP_DIRS
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _started_timestamp(stamp: str) -> float | None:
+    """把 `started_at` 解析成 Unix 时间戳；无法解析返回 None。
+
+    这里绝不能用 `time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S%z"))`：
+    `%z` 只让 strptime 认出偏移，mktime 却一律按**本机时区**解释 wall clock，
+    时区信息被静默丢掉。在 +0800 的机器上看不出问题，一放到 UTC 的服务器上，
+    每个任务的 started_at 都会被算成 8 小时前（或后），超时要么立刻误杀、
+    要么永远不触发。`datetime.strptime` 保留 tzinfo，`.timestamp()` 才是对的。
+    """
+    try:
+        return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (TypeError, ValueError):
+        # 老版本写过不带偏移的字符串（"%Y-%m-%dT%H:%M:%S"），按本地时间兜底
+        try:
+            return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S").timestamp()
+        except (TypeError, ValueError):
+            return None
 
 
 @dataclass
@@ -196,8 +216,9 @@ class JobManager:
                 settled.append(job)
                 continue
             if job.timeout_seconds > 0:
-                started = time.mktime(time.strptime(job.started_at, "%Y-%m-%dT%H:%M:%S%z"))
-                if now - started > job.timeout_seconds:
+                started = _started_timestamp(job.started_at)
+                # 时间戳解析不出来时不敢猜：宁可让任务继续跑，也不要误杀。
+                if started is not None and now - started > job.timeout_seconds:
                     self._terminate(job)
                     self._settle(job, "timeout", None)
                     settled.append(job)
