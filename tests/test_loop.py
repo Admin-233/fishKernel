@@ -145,3 +145,58 @@ def test_no_delay_event_when_no_sleep(archive):
     make_kernel(archive, [Completion(text="ok")]).run()
     delays = [event for event in read_events(archive.events_path) if event.type == "delay"]
     assert delays == []
+
+
+# ---- 不可重试错误不该无限重试 -------------------------------------------------
+# 真实事故（2026-10-27 22:05）：我往 ToolsRegister.txt 追加了一行带路径的脏数据，
+# Archive.validate() 从此每次都抛 ArchiveError。内核每分钟重试一次，
+# 连续失败 40 次、卡了 10 分钟 —— 期间完全没有产出。
+#
+# 本质问题：`retryable=failures < 5` 只是**写进事件里的标记**，
+# 没有任何代码真的用它决定要不要继续。而「存档格式坏了」这类错误
+# 重试一万次也不会自愈，只会持续烧时间。
+
+
+# 用真实的不可恢复错误类型，而不是自造一个 —— 
+# 测试的价值在于验证「哪类异常会被判定为致命」，自造类型就测不到这个判断。
+from fishkernel.archive import ArchiveError as _FatalError
+
+
+def test_fatal_error_stops_retrying(archive):
+    """不可恢复的错误应当停下并返回非零，而不是无限重试。"""
+
+    kernel = make_kernel(archive, [Completion(text="ok")], max_turns=50)
+    calls = {"n": 0}
+
+    def boom(turn, state):
+        calls["n"] += 1
+        raise _FatalError("存档坏了，重试不会好")
+
+    kernel._turn = boom  # type: ignore[method-assign]
+
+    code = kernel.run()
+
+    assert code != 0, "不可恢复的错误应当返回非零退出码"
+    assert calls["n"] <= 2, f"重试了 {calls['n']} 次，太多 —— 这类错误不该重试"
+
+
+def test_retryable_error_still_retries(archive):
+    """普通异常仍要重试 —— 别把修复做成「一错就死」。"""
+
+    kernel = make_kernel(archive, [Completion(text="ok")], max_turns=5)
+    calls = {"n": 0}
+
+    def flaky(turn, state):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("网络抖了一下")
+        raise SystemExit(0)  # 第二次直接正常退出
+
+    kernel._turn = flaky  # type: ignore[method-assign]
+
+    try:
+        kernel.run()
+    except SystemExit:
+        pass
+
+    assert calls["n"] >= 2, "第一次失败后应当重试"

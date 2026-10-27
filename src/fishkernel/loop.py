@@ -18,12 +18,23 @@ from .control import Control
 from .events import EventLog, read_events
 from .jobs import Job, JobManager
 from .llm import Completion, ContextOverflowError, LLMClient, OpenAIClient
+from .archive import ArchiveError
+from .config import ConfigError
 from .lock import InstanceLock, LockError
 from .messages import build_messages
 from .restart import spawn_successor
 from .spill import cleanup as spill_cleanup
 from .tokens import TokenMeter, estimate_messages, estimate_tools
 from .tools import ToolBox
+
+
+# 这些错误说明存档或配置本身有问题，重试多少次都不会自愈。
+# 遇到就停下并返回非零，把问题暴露出来让人处理 —— 空转只会烧时间。
+FATAL_ERRORS: tuple[type[BaseException], ...] = (ArchiveError, ConfigError)
+
+
+def _is_fatal(exc: BaseException) -> bool:
+    return isinstance(exc, FATAL_ERRORS)
 
 
 class Logger:
@@ -90,6 +101,7 @@ class Kernel:
             raise
         self._install_signals()
         reason = "max_turns"
+        exit_code = 0
         self.events.append(
             "session/start",
             model=self.config.model,
@@ -153,15 +165,28 @@ class Kernel:
                     raise
                 except Exception as exc:  # noqa: BLE001 - 内核必须活下来
                     failures += 1
+                    fatal = _is_fatal(exc)
                     self.logger.error(traceback.format_exc(limit=8).strip())
                     self.events.append(
                         "error",
                         stage="turn",
                         message=f"{type(exc).__name__}: {exc}"[:1000],
-                        retryable=failures < 5,
+                        retryable=not fatal,
                         failures=failures,
+                        fatal=fatal,
                     )
                     self._write_state("error")
+
+                    if fatal:
+                        # 存档/配置类错误重试不会自愈（2026-10-27 实测：
+                        # ToolsRegister.txt 写坏后连续失败 40 次、卡了 10 分钟）。
+                        # 停下来让人看到问题，比假装还在工作更有价值。
+                        self.logger.error(
+                            f"遇到不可恢复的错误，内核停止：{type(exc).__name__}: {exc}"
+                        )
+                        reason = "fatal"
+                        exit_code = 1
+                        break
                     if self.error_backoff_base > 0:
                         backoff = min(60.0, self.error_backoff_base ** min(failures, 6))
                         _, why = self.control.interruptible_sleep(backoff)
@@ -172,12 +197,14 @@ class Kernel:
             reason = "interrupt"
         finally:
             self._write_state("stopped")
-            self.events.append("session/end", reason=reason, turns=self.turns)
+            self.events.append(
+                "session/end", reason=reason, turns=self.turns, exit_code=exit_code
+            )
             self.events.close()
             self.lock.release()
             self._restore_signals()
             self.logger.info(f"内核退出：{reason}（共 {self.turns} 轮）")
-        return 0
+        return exit_code
 
     def _handover(self, request: dict[str, object] | None = None) -> bool:
         """交班：先启动接班人，再释放锁，然后由调用方正常退出。"""
