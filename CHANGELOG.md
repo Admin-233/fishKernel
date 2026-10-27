@@ -5,8 +5,9 @@
 - 性能：20 万条事件（42 MB）下，冷启动快照 554 ms → 稳态轮询 9.8 ms。
   - `UsageCache` 增量折叠 usage（`tokens.fold_usage_into`），不再每次重算全量；
   - 增量取事件改用 `bisect` 二分定位，不再全表扫描。
-- 新增 `tests/test_web.py`（29 项：投影、快照、真实 HTTP 往返、token 鉴权、usage 缓存一致性）、`scripts/smoke_web.sh`、`docs/web.md`。
-- 144 -> 173 passed。
+- 界面细节：事件流里超过 240 字的内容（工具结果、长命令）折叠成一行摘要，点开看全文；任务列表按 `started_at` 排序（`JobManager.list()` 是按 `proc-<hex>` 目录名排的，与时间无关）。
+- 新增 `tests/test_web.py`（30 项：投影、快照、真实 HTTP 往返、token 鉴权、usage 缓存一致性、任务排序）、`scripts/smoke_web.sh`、`docs/web.md`。
+- 144 -> 174 passed。
 
 # 更新日志
 

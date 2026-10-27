@@ -41,6 +41,13 @@ PAGE = r"""<!DOCTYPE html>
   #events { flex: 1; overflow-y: auto; padding: 10px 12px; }
   .ev { margin: 0 0 6px; white-space: pre-wrap; word-break: break-word; }
   .ev .t { color: var(--dim); margin-right: 6px; font-size: 11px; }
+  .ev details > summary { cursor: pointer; list-style: none; }
+  .ev details > summary::-webkit-details-marker { display: none; }
+  .ev details > summary::before { content: "▸ "; color: var(--dim); }
+  .ev details[open] > summary::before { content: "▾ "; }
+  .ev details > summary .more { color: var(--dim); }
+  .ev details[open] > summary .more { display: none; }
+  .ev details > .body { margin: 2px 0 0 14px; border-left: 1px solid var(--line); padding-left: 8px; }
   .ev.user { color: var(--user); }
   .ev.assistant { color: var(--assistant); }
   .ev.call { color: var(--call); }
@@ -127,12 +134,30 @@ PAGE = r"""<!DOCTYPE html>
     return m ? m[1] : ts;
   }
 
+  // 工具结果和长输出默认折叠成一行摘要：事件流要能一眼扫过去，
+  // 想看细节再点开。这与 TUI 里「长工具调用压缩显示」是同一个取舍。
+  var COLLAPSE_OVER = 240;
+
   function appendEvent(ev) {
     if (!ev || !ev.text) return;
     var atBottom = evBox.scrollTop + evBox.clientHeight >= evBox.scrollHeight - 40;
     var div = document.createElement("div");
     div.className = "ev " + (ev.cls || "");
-    div.innerHTML = '<span class="t">' + esc(fmtTime(ev.ts)) + "</span>" + esc(ev.text);
+    var stamp = '<span class="t">' + esc(fmtTime(ev.ts)) + "</span>";
+    var text = ev.text;
+
+    if (text.length > COLLAPSE_OVER) {
+      var nl = text.indexOf("\n");
+      var head = nl > 0 ? text.slice(0, nl) : text.slice(0, COLLAPSE_OVER);
+      var rest = nl > 0 ? text.slice(nl + 1) : text.slice(COLLAPSE_OVER);
+      var lines = rest.split("\n").length;
+      div.innerHTML = stamp + '<details><summary>' + esc(head) +
+        '<span class="more">  …（' + lines + ' 行，' + rest.length + ' 字）</span></summary>' +
+        '<div class="body">' + esc(rest) + "</div></details>";
+    } else {
+      div.innerHTML = stamp + esc(text);
+    }
+
     evBox.appendChild(div);
     if (atBottom || first) evBox.scrollTop = evBox.scrollHeight;
   }

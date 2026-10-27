@@ -313,3 +313,27 @@ def test_snapshot_accepts_precomputed_usage(archive, log):
     preset = UsageTotals(calls=99, prompt_tokens=42)
     snap = build_snapshot(archive, usage=preset)
     assert snap["state"]["usage"]["calls"] == 99
+
+
+def test_jobs_sorted_by_start_time(archive, log):
+    """任务列表必须按开始时间排，而不是按 proc-<hex> 目录名。"""
+    import json as _json
+
+    from fishkernel.jobs import JobManager
+
+    manager = JobManager(archive)
+    stamps = ["2026-10-27T10:00:00+0800", "2026-10-27T12:00:00+0800", "2026-10-27T11:00:00+0800"]
+    for index, stamp in enumerate(stamps):
+        job_id = f"proc-{'f' * (10 - index)}0000"  # 目录名顺序与时间顺序故意错开
+        job_dir = manager.job_dir(job_id)
+        job_dir.mkdir(parents=True)
+        meta = {
+            "id": job_id, "command": f"echo {index}", "cwd": str(archive.root),
+            "label": f"任务{index}", "status": "completed", "pid": None, "exit_code": 0,
+            "started_at": stamp, "ended_at": stamp, "timeout_seconds": 0.0, "adopted": False,
+        }
+        (job_dir / "meta.json").write_text(_json.dumps(meta), encoding="utf-8")
+        (job_dir / "stdout.log").write_text("x", encoding="utf-8")
+
+    snap = build_snapshot(archive)
+    assert [job["label"] for job in snap["jobs"]] == ["任务0", "任务2", "任务1"]

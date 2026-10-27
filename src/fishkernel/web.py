@@ -167,11 +167,15 @@ def build_snapshot(
         fold_usage_into(usage, events)
     totals = usage
 
+    # JobManager.list() 按目录名（proc-<hex>）排序，那是随机的；
+    # 界面上要看的是「最近在做什么」，所以按 started_at 排序后再取尾部。
+    manager = JobManager(archive)
+    all_jobs = sorted(manager.list(), key=lambda job: (job.started_at, job.id))
     jobs = []
-    for job in JobManager(archive).list()[-job_limit:]:
+    for job in all_jobs[-job_limit:]:
         item = job.to_dict()
         try:
-            item["stdout_size"] = JobManager(archive).stdout_path(job.id).stat().st_size
+            item["stdout_size"] = manager.stdout_path(job.id).stat().st_size
         except OSError:
             item["stdout_size"] = 0
         jobs.append(item)
