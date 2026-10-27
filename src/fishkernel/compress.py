@@ -265,25 +265,40 @@ class Compressor:
         if not pending:
             return 0
 
-        replace_text: str | None = None
-        appended: list[str] = []
+        # 语义：按事件顺序重放 memory 操作，replace 清空已有内容（含前面的 append），
+        # 但**不影响它之后的 append**。
+        #
+        # 历史 bug：这里写过 `if mode == "replace": replace_text = content; appended = []`。
+        # appended 被清空之后，后续 append 仍追加到同一个列表里，最后却因为
+        # `if replace_text is not None` 分支只写 replace_text 而被整个丢弃——
+        # 即「replace 之后的 append 全部静默丢失」，函数却照样返回处理条数。
+        # 这正是 Agent 自身的常见用法（先 replace 重写长期记忆，再 append 追加），
+        # 一旦触发压缩就会真的丢记忆。
+        parts: list[str] = []
         for event in pending:
             mode = str(event.data.get("mode") or "append")
             content = str(event.data.get("content") or "").strip()
             if not content:
                 continue
             if mode == "replace":
-                replace_text = content          # 后写覆盖先写
-                appended = []
+                parts = [content]               # 覆盖此前的全部内容
             else:
-                appended.append(content)
+                parts.append(content)
+        if not parts:
+            return 0
+        replaced = any(
+            str(event.data.get("mode") or "append") == "replace"
+            and str(event.data.get("content") or "").strip()
+            for event in pending
+        )
 
         current = self.archive.read_text(self.archive.long_term_memory_path)
-        if replace_text is not None:
-            updated = replace_text + "\n"
+        extra = "\n\n".join(parts)
+        if replaced:
+            # 有 replace：以它为准，不保留磁盘上的旧内容
+            updated = extra + "\n"
         else:
             base = current.rstrip()
-            extra = "\n\n".join(appended)
             updated = (base + "\n\n" + extra + "\n") if base else (extra + "\n")
         self.archive.write_long_term_memory(updated)
         return len(pending)

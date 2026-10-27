@@ -1,3 +1,36 @@
+## v0.4.3
+
+- **修复长期记忆在压缩时静默丢失**（数据丢失，严重）。`Compressor._flush_pending_memory()`
+  把一个压缩区间内的 `memory/write` 事件重放到 `LongTermMemory.txt`，原逻辑是：
+
+  ```python
+  if mode == "replace":
+      replace_text = content
+      appended = []          # 清空之前的 append
+  else:
+      appended.append(content)
+  ...
+  if replace_text is not None:
+      updated = replace_text + "\n"      # 只写 replace，appended 整个被丢弃
+  ```
+
+  `replace` **之后**的 `append` 会追加进 `appended`，但最终拼结果时走的是
+  `replace_text` 分支，`appended` 一个字都不会写出去——而函数照样返回
+  `len(pending)`，看上去「全部处理成功」。也就是说：**replace 之后的所有 append
+  被静默丢弃**。
+
+  这正是 Agent 自己的典型用法（先 `replace` 重写长期记忆，再 `append` 追加新事实），
+  一旦压缩触发就会真的丢记忆。而记忆只在压缩时才落盘，所以平时完全看不出来。
+
+  改为按事件顺序重放：`replace` 清空**此前**的内容（含早于它的 append），
+  但后续 append 照常生效；同时区分「本批含 replace」（不保留磁盘旧内容）与
+  「纯 append」（在磁盘旧内容后追加）。
+
+- 新增 6 项回归测试覆盖各种顺序：append→replace→append、纯 append、纯 replace、
+  多次 replace、空事件、全空白内容。已用「临时还原 bug」验证其中 3 项会失败。
+
+- 179 -> 185 passed。
+
 ## v0.4.2
 
 用 ruff 扫 `F`（pyflakes）/ `B`（bugbear）两类规则时发现的问题，逐个核实后修复：

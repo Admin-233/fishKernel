@@ -107,3 +107,98 @@ def test_no_stale_lock_when_closed(archive, config, log):
     log.append("compaction/end", ok=True)
     compressor = Compressor(archive, config, ScriptedClient(), log)
     assert compressor.recover_stale() is False
+
+
+# ---- 待写记忆落盘（_flush_pending_memory）-----------------------------------
+# 事故：曾经写成
+#     if mode == "replace":
+#         replace_text = content
+#         appended = []          # 清空之前的 append
+#     else:
+#         appended.append(content)
+# 最后 `if replace_text is not None:` 只用 replace_text 拼结果，
+# 于是 **replace 之后的所有 append 被静默丢弃**，函数却照样返回处理条数。
+# 「先 replace 重写长期记忆，再 append 追加」正是 Agent 自己的常见用法。
+
+
+def _memory_events(*pairs):
+    from fishkernel.events import Event
+
+    return [
+        Event(index + 1, "", "memory/write", {"mode": mode, "content": content})
+        for index, (mode, content) in enumerate(pairs)
+    ]
+
+
+def _flusher(archive):
+    """只取 _flush_pending_memory 所需的两个属性，绕开构造函数。"""
+    from fishkernel.compress import Compressor
+
+    compressor = Compressor.__new__(Compressor)
+    compressor.archive = archive
+
+    class _Logger:
+        def info(self, message):  # noqa: ARG002
+            pass
+
+    compressor.logger = _Logger()
+    return compressor
+
+
+def test_flush_appends_after_replace_are_kept(archive):
+    archive.write_long_term_memory("磁盘上的旧内容\n")
+    compressor = _flusher(archive)
+    events = _memory_events(
+        ("append", "追加A"),
+        ("replace", "替换后的新记忆"),
+        ("append", "追加C"),
+    )
+    assert compressor._flush_pending_memory(events) == 3
+
+    text = archive.read_text(archive.long_term_memory_path)
+    assert "替换后的新记忆" in text
+    assert "追加C" in text, "replace 之后的 append 被丢了"
+    assert "追加A" not in text, "replace 之前的 append 应当被覆盖"
+    assert "磁盘上的旧内容" not in text, "replace 应当覆盖磁盘上的旧内容"
+
+
+def test_flush_append_only_keeps_existing(archive):
+    archive.write_long_term_memory("旧内容\n")
+    compressor = _flusher(archive)
+    compressor._flush_pending_memory(_memory_events(("append", "新的一条")))
+
+    text = archive.read_text(archive.long_term_memory_path)
+    assert "旧内容" in text and "新的一条" in text
+
+
+def test_flush_replace_only_discards_old(archive):
+    archive.write_long_term_memory("旧内容\n")
+    compressor = _flusher(archive)
+    compressor._flush_pending_memory(_memory_events(("replace", "全新的")))
+
+    text = archive.read_text(archive.long_term_memory_path)
+    assert text.strip() == "全新的"
+
+
+def test_flush_last_replace_wins(archive):
+    compressor = _flusher(archive)
+    compressor._flush_pending_memory(
+        _memory_events(("replace", "第一版"), ("append", "中间的"), ("replace", "第二版"))
+    )
+    text = archive.read_text(archive.long_term_memory_path)
+    assert "第二版" in text
+    assert "第一版" not in text and "中间的" not in text
+
+
+def test_flush_no_events_leaves_file_untouched(archive):
+    archive.write_long_term_memory("保持原样\n")
+    compressor = _flusher(archive)
+    assert compressor._flush_pending_memory([]) == 0
+    assert archive.read_text(archive.long_term_memory_path) == "保持原样\n"
+
+
+def test_flush_ignores_blank_content(archive):
+    compressor = _flusher(archive)
+    compressor._flush_pending_memory(_memory_events(("append", "   "), ("replace", "")))
+    # 全是空白 → 不该生成文件内容，也不该抛异常
+    assert archive.read_text(archive.long_term_memory_path).strip() == ""
