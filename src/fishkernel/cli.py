@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--height", type=int, default=None, help="固定高度（默认取终端）")
     p_tui.add_argument("--refresh", type=float, default=0.2, help="刷新间隔秒（默认 0.2）")
 
+    p_cost = sub.add_parser("cost", help="统计累计用量与花费")
+    p_cost.add_argument("directory")
+    p_cost.add_argument("--json", action="store_true", help="输出 JSON")
+
     return parser
 
 
@@ -83,11 +87,59 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_status(args)
         if args.command == "tui":
             return _cmd_tui(args)
+        if args.command == "cost":
+            return _cmd_cost(args)
     except (ArchiveError, ConfigError, ValueError, FileNotFoundError, LockError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     parser.error("未知命令")
     return 1
+
+
+def _cmd_cost(args) -> int:
+    """统计累计用量与花费。"""
+    import json as _json
+
+    from .events import read_events
+    from .tokens import PRICE_CACHE_HIT, PRICE_CACHE_MISS, PRICE_OUTPUT, fold_usage
+
+    archive = _open_archive(args.directory)
+    totals = fold_usage(read_events(archive.events_path))
+
+    if totals.calls == 0:
+        print("还没有任何模型调用记录")
+        return 0
+
+    if args.json:
+        print(_json.dumps({
+            "calls": totals.calls,
+            "prompt_tokens": totals.prompt_tokens,
+            "cache_hit": totals.cache_hit,
+            "cache_miss": totals.cache_miss,
+            "output_tokens": totals.output_tokens,
+            "reasoning_tokens": totals.reasoning_tokens,
+            "calls_without_cache_data": totals.calls_without_cache_data,
+            "cache_hit_rate": round(totals.cache_hit_rate, 4),
+            "cost_yuan": round(totals.cost_yuan, 2),
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    print("用量统计")
+    print(f"  模型调用      {totals.calls:,} 次")
+    print(f"  输入 token    {totals.prompt_tokens:,}")
+    sampled = totals.calls - totals.calls_without_cache_data
+    if sampled:
+        note = f"（基于 {sampled:,}/{totals.calls:,} 条有缓存数据的记录）"
+        print(f"  缓存命中      {totals.cache_hit_rate:.1%} {note}")
+        print(f"    命中        {totals.cache_hit:,}")
+        print(f"    未命中      {totals.cache_miss:,}")
+    print(f"  输出 token    {totals.output_tokens:,}")
+    if totals.reasoning_tokens:
+        print(f"    其中推理    {totals.reasoning_tokens:,}")
+    print()
+    print(f"  估算花费      ¥{totals.cost_yuan:,.2f}")
+    print(f"  （单价：命中 ¥{PRICE_CACHE_HIT}/M，未命中 ¥{PRICE_CACHE_MISS}/M，输出 ¥{PRICE_OUTPUT}/M）")
+    return 0
 
 
 def _open_archive(directory: str) -> Archive:
