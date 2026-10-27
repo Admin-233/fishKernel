@@ -28,6 +28,7 @@
 | 唤醒 | `ctl wake` 或 TUI 的 `:wake`，让等待中的内核提前结束延时 |
 | 自我保护 | 拒绝终止内核自身、父进程或同进程组的命令（只挡这一种，不是沙箱） |
 | 终端界面 | `fishkernel tui`：上半屏实时事件流、下半屏输入框，分类着色，长工具调用自动压缩 |
+| 网页控制台 | `fishkernel web`：零依赖 stdlib 的浏览器界面，事件流 + 任务列表 + 暂停/继续/唤醒/重启/发消息 |
 | 崩溃恢复 | 未闭合的压缩事务、孤儿工具调用、孤儿进程都有明确处理路径 |
 | 可插拔工具 | `Tools/` 目录登记命令行工具用法，模型通过 `spawn` 调用 |
 
@@ -55,6 +56,7 @@ fishkernel run ./archives/demo
 ```bash
 fishkernel status ./archives/demo --tail 20 --jobs
 fishkernel tui ./archives/demo             # 实时观察 + 直接对话
+fishkernel web ./archives/demo             # 浏览器里观察和控制（http://127.0.0.1:8787/）
 fishkernel say ./archives/demo "去 Tools 目录看看有什么可用的"
 fishkernel ctl ./archives/demo pause        # 暂停（不消耗 API）
 fishkernel ctl ./archives/demo resume
@@ -249,7 +251,7 @@ fishKernel/
 4. 异步任务不跨内核重启续期，只能接管观察；孤儿进程输出无人回收。
 5. 非流式请求：单次调用最长等 300 秒，期间看不到进度。
 6. 只在 Linux/arm64 上验证过；Windows 分支（`taskkill` 杀进程组）未测。
-7. 桌面 GUI / 网页控制台未实现（控制面已全部落在文件上，接 UI 不需要改内核）。
+7. 网页控制台已实现（`fishkernel web`），桌面 GUI 未实现（控制面已全部落在文件上，接 UI 不需要改内核）。
 8. 压缩只保证“更短”，不保证摘要信息不丢；摘要质量未评测。
 9. TUI 只读事件流，不支持鼠标/搜索；长事件只显示摘要，完整内容看 `events.jsonl`。
 
@@ -257,6 +259,7 @@ fishKernel/
 
 - [docs/quickstart.md](docs/quickstart.md) — 从零跑起第一个 Agent
 - [docs/tui.md](docs/tui.md) — 终端界面：布局、颜色、按键、命令
+- [docs/web.md](docs/web.md) — 网页控制台：接口、性能、安全边界
 - [docs/tools.md](docs/tools.md) — 工具协议与自定义工具
 - [docs/operations.md](docs/operations.md) — 运行、监控、恢复、清理
 - [docs/testing.md](docs/testing.md) — 测试与部署

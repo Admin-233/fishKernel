@@ -64,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--height", type=int, default=None, help="固定高度（默认取终端）")
     p_tui.add_argument("--refresh", type=float, default=0.2, help="刷新间隔秒（默认 0.2）")
 
+    p_web = sub.add_parser("web", help="启动网页控制台（零依赖，只读写存档文件）")
+    p_web.add_argument("directory")
+    p_web.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1，仅本机）")
+    p_web.add_argument("--port", type=int, default=8787, help="监听端口（默认 8787，0 表示随机）")
+    p_web.add_argument("--token", default=None, help="可选的访问令牌（作为 X-Fish-Token 或 ?token= 传）")
+
     p_cost = sub.add_parser("cost", help="统计累计用量与花费")
     p_cost.add_argument("directory")
     p_cost.add_argument("--json", action="store_true", help="输出 JSON")
@@ -89,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_tui(args)
         if args.command == "cost":
             return _cmd_cost(args)
+        if args.command == "web":
+            return _cmd_web(args)
     except (ArchiveError, ConfigError, ValueError, FileNotFoundError, LockError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
@@ -139,6 +147,14 @@ def _cmd_cost(args) -> int:
     print()
     print(f"  估算花费      ¥{totals.cost_yuan:,.2f}")
     print(f"  （单价：命中 ¥{PRICE_CACHE_HIT}/M，未命中 ¥{PRICE_CACHE_MISS}/M，输出 ¥{PRICE_OUTPUT}/M）")
+    return 0
+
+
+def _cmd_web(args) -> int:
+    """网页控制台：与 `ctl` / `say` 等价，只是换了个界面。"""
+    from .web import serve
+
+    serve(args.directory, host=args.host, port=args.port, token=args.token)
     return 0
 
 

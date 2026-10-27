@@ -313,7 +313,15 @@ class UsageTotals:
 
 def fold_usage(events) -> UsageTotals:
     """从事件里折叠出累计用量。events 需含 assistant/message 的 usage。"""
-    totals = UsageTotals()
+    return fold_usage_into(UsageTotals(), events)
+
+
+def fold_usage_into(totals: UsageTotals, events) -> UsageTotals:
+    """把一批事件累加进已有的 totals（就地修改并返回）。
+
+    Web 控制台每秒轮询一次，事件日志会涨到几十万条；有了这个函数就能
+    只折叠「新增的那几条」，而不必每次都把全量事件重算一遍。
+    """
     for event in events:
         if event.type != "assistant/message":
             continue

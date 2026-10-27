@@ -1,3 +1,13 @@
+## v0.4.0
+
+- 新增 `fishkernel web`：零依赖（stdlib `http.server`）网页控制台。事件流增量拉取、任务列表、暂停/继续/唤醒/交班重启/停止、发消息；与 TUI 同一套边界——只读事件日志、只写控制文件，不碰内核进程和锁。默认只监听 `127.0.0.1`，可用 `--host` / `--token` 开放。
+- 网页接口：`GET /api/snapshot`、`GET /api/job_output`、`POST /api/say`、`POST /api/ctl`，可直接用 curl 驱动。
+- 性能：20 万条事件（42 MB）下，冷启动快照 554 ms → 稳态轮询 9.8 ms。
+  - `UsageCache` 增量折叠 usage（`tokens.fold_usage_into`），不再每次重算全量；
+  - 增量取事件改用 `bisect` 二分定位，不再全表扫描。
+- 新增 `tests/test_web.py`（29 项：投影、快照、真实 HTTP 往返、token 鉴权、usage 缓存一致性）、`scripts/smoke_web.sh`、`docs/web.md`。
+- 144 -> 173 passed。
+
 # 更新日志
 
 ## v0.3.0
