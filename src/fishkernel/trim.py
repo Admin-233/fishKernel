@@ -34,6 +34,7 @@ from pathlib import Path
 from .archive import Archive
 from .atomic import write_atomic
 from .events import Event, read_events
+from .lock import InstanceLock, LockError
 from .messages import build_messages
 
 # 归档文件放在 Memory/ 下，和 Archive-<ts>.txt（压缩存档）并列
@@ -114,8 +115,27 @@ def plan_trim(archive: Archive, events: list[Event] | None = None) -> TrimPlan:
     return TrimPlan(cutoff_seq=to_seq, archived=archived, kept=kept, summary_event=summary_event)
 
 
+def _ensure_no_kernel_running(archive: Archive) -> None:
+    """确认没有内核在跑，否则拒绝改写事件流。
+
+    apply_trim 用 write_atomic 整体替换 events.jsonl。如果内核同时在追加
+    事件，那些新事件会随着旧文件一起被覆盖 —— 实测并发写入 300 条时
+    永久丢失 7 条。所以必须先确保独占。
+    """
+    probe = InstanceLock(archive.lock_path)
+    try:
+        probe.acquire(timeout=0.0)
+    except LockError as exc:
+        raise TrimError(
+            "内核正在运行，不能 trim。先停内核（fishkernel ctl <存档> stop），"
+            "否则并发写入的事件会丢失。"
+        ) from exc
+    probe.release()
+
+
 def apply_trim(archive: Archive, plan: TrimPlan, *, stamp: str | None = None) -> Path | None:
     """执行归档：先把要挪走的事件写成归档文件，再原子替换 events.jsonl。"""
+    _ensure_no_kernel_running(archive)
     if plan.empty:
         return None
 

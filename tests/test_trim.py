@@ -207,3 +207,116 @@ def test_stats_shape(archive, log):
     assert info["bytes"] > 0
     assert info["last_seq"] >= info["first_seq"]
     assert info["archives"] == 0
+
+
+# ---- trim 与并发写入 ---------------------------------------------------------
+# 真实 bug（2026-10-27）：apply_trim 用 write_atomic 整体替换 events.jsonl，
+# 但没有任何锁检查。如果内核同时在追加事件，那些新事件会随旧文件一起被覆盖。
+# 实测并发写入 300 条时永久丢失 7 条（seq 6038..6044）。
+
+
+def _archive_with_compressible_history(tmp_path):
+    """造一个「已压缩过、因此有可归档内容」的存档。"""
+    import json
+
+    from fishkernel.archive import create_archive
+
+    root = tmp_path / "trimable"
+    create_archive(root, name="t", api_key="sk-t")
+
+    events = [
+        {"seq": 1, "ts": "", "type": "user/message", "data": {"text": "老消息 1"}},
+        {"seq": 2, "ts": "", "type": "user/message", "data": {"text": "老消息 2"}},
+        {"seq": 3, "ts": "", "type": "compaction/start", "data": {}},
+        {"seq": 4, "ts": "", "type": "compaction/summary",
+         "data": {"summary": "摘要", "from_seq": 1, "to_seq": 2}},
+        {"seq": 5, "ts": "", "type": "compaction/end", "data": {}},
+        {"seq": 6, "ts": "", "type": "user/message", "data": {"text": "新消息"}},
+    ]
+    (root / "Runtime" / "events.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in events) + "\n",
+        encoding="utf-8")
+
+    from fishkernel.archive import Archive
+    from fishkernel.events import clear_parse_cache
+
+    clear_parse_cache(root / "Runtime" / "events.jsonl")
+    return Archive(root)
+
+
+def test_apply_trim_refuses_when_kernel_running(tmp_path):
+    """内核持锁时必须拒绝，而不是静默丢数据。"""
+    import pytest
+
+    from fishkernel.lock import InstanceLock
+    from fishkernel.trim import TrimError, apply_trim, plan_trim
+
+    archive = _archive_with_compressible_history(tmp_path)
+    plan = plan_trim(archive)
+
+    holder = InstanceLock(archive.lock_path)
+    holder.acquire(timeout=0.0)
+    try:
+        with pytest.raises(TrimError) as excinfo:
+            apply_trim(archive, plan)
+        assert "内核正在运行" in str(excinfo.value)
+    finally:
+        holder.release()
+
+
+def test_apply_trim_works_when_no_kernel(tmp_path):
+    """没有内核持锁时照常工作（别把修复做成永久拒绝）。"""
+    from fishkernel.trim import apply_trim, plan_trim
+
+    archive = _archive_with_compressible_history(tmp_path)
+    plan = plan_trim(archive)
+    result = apply_trim(archive, plan)
+    assert result is not None, "正常情况应当产出归档文件"
+
+
+def test_concurrent_writes_survive_when_trim_refused(tmp_path):
+    """被拒绝之后，并发写入的事件一条都不能少。"""
+    import threading
+    import time
+
+    import pytest
+
+    from fishkernel.events import EventLog, clear_parse_cache, read_events
+    from fishkernel.lock import InstanceLock
+    from fishkernel.trim import TrimError, apply_trim, plan_trim
+
+    archive = _archive_with_compressible_history(tmp_path)
+    plan = plan_trim(archive)
+    written: list[int] = []
+    stop = threading.Event()
+
+    def writer() -> None:
+        log = EventLog(archive.events_path).open()
+        try:
+            for index in range(60):
+                if stop.is_set():
+                    break
+                written.append(log.append("user/message", text=f"w{index}").seq)
+                time.sleep(0.002)
+        finally:
+            log.close()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    time.sleep(0.05)
+
+    holder = InstanceLock(archive.lock_path)
+    holder.acquire(timeout=0.0)
+    try:
+        with pytest.raises(TrimError):
+            apply_trim(archive, plan)
+    finally:
+        holder.release()
+
+    stop.set()
+    thread.join(timeout=30)
+
+    clear_parse_cache(archive.events_path)
+    surviving = {event.seq for event in read_events(archive.events_path)}
+    lost = [seq for seq in written if seq not in surviving]
+    assert lost == [], f"被拒绝后仍有事件丢失：{lost[:8]}"
