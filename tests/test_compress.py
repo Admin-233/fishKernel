@@ -282,3 +282,66 @@ def test_normal_tail_retains_within_budget(archive, config, log):
     assert start.data["retained_oversized"] is False
     assert start.data["retained_units"] >= 1
     assert start.data["region_units"] + start.data["retained_units"] == 10
+
+
+# ---- 小压缩区 / 摘要不比原文短 ----------------------------------------------
+# _summarize_once 有收敛条件：摘要 token 必须 < 压缩区 token，否则重试一次后放弃。
+# 这条守卫很重要——如果没有它，一个"比原文还长"的摘要会写进 Digest，
+# 反而增大上下文，压缩就成了负优化。
+# 下面这个场景确保：摘要过长时走 abort，绝不落盘、绝不改写历史。
+
+
+def test_aborts_when_summary_longer_than_region(archive, config, log):
+    for index in range(20):
+        log.append("user/message", text=f"q{index}")
+        log.append("assistant/message", text=f"a{index}", tool_calls=[])
+
+    long_summary = "## 主要请求与意图\n" + "刻意写得比原文还长的摘要。" * 50
+    client = ScriptedClient(
+        [Completion(text=long_summary, usage={"prompt_tokens": 10, "completion_tokens": 10})] * 3
+    )
+    compressor = Compressor(archive, config, client, log)
+    outcome = compressor.compact(retain_override=50)
+
+    assert outcome.compacted is False
+    assert outcome.reason == "summary_not_shorter"
+
+    events = read_events(archive.events_path)
+    types = [event.type for event in events]
+    assert "compaction/abort" in types
+    assert "compaction/summary" not in types, "摘要过长却仍然提交了"
+    assert archive.read_text(archive.digest_path).strip() == "", "Digest 被写坏了"
+
+
+def test_abort_leaves_history_intact(archive, config, log):
+    """abort 之后，上下文投影必须与压缩前完全一致。"""
+    for index in range(20):
+        log.append("user/message", text=f"q{index}")
+        log.append("assistant/message", text=f"a{index}", tool_calls=[])
+
+    from fishkernel.messages import build_messages
+
+    before = build_messages(read_events(archive.events_path), archive.system_text())
+
+    client = ScriptedClient(
+        [Completion(text="长" * 2000, usage={"prompt_tokens": 10, "completion_tokens": 10})] * 3
+    )
+    Compressor(archive, config, client, log).compact(retain_override=50)
+
+    after = build_messages(read_events(archive.events_path), archive.system_text())
+    assert before == after, "压缩中止后历史被改写了"
+
+
+def test_normal_compaction_still_works_after_abort(archive, config, log):
+    """中止一次之后，下一次（摘要正常）应当照常压缩成功。"""
+    for index in range(20):
+        log.append("user/message", text=f"q{index}")
+        log.append("assistant/message", text=f"a{index}", tool_calls=[])
+
+    bad = ScriptedClient([Completion(text="长" * 2000, usage={})] * 3)
+    assert Compressor(archive, config, bad, log).compact(retain_override=50).compacted is False
+
+    good = ScriptedClient([Completion(text="## 概要\n简短摘要。", usage={})])
+    outcome = Compressor(archive, config, good, log).compact(retain_override=50)
+    assert outcome.compacted is True
+    assert outcome.reason == "ok"
