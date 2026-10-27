@@ -12,7 +12,7 @@ import pytest
 
 from fishkernel.archive import save_kernel_state
 from fishkernel.control import Control
-from fishkernel.events import Event, EventLog
+from fishkernel.events import Event
 from fishkernel.web import WebState, build_snapshot, make_handler, project_event
 
 

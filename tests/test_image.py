@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from fishkernel.tools import (
-    MAX_IMAGE_BYTES,
     ToolBox,
     _sniff_image,
 )
@@ -212,7 +211,6 @@ def test_image_message_estimate_is_stable_regardless_of_image_size():
 
 def test_compaction_keeps_more_units_when_tail_has_image(archive, monkeypatch):
     """带有大图的尾部单元不该把保留预算吃光。"""
-    from fishkernel import compress as compress_mod
     from fishkernel.messages import build_messages as bm
     from fishkernel.tokens import estimate_messages
 

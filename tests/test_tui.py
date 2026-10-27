@@ -4,13 +4,11 @@ import json
 
 from fishkernel.archive import save_kernel_state
 from fishkernel.control import Control
-from fishkernel.events import Event, EventLog
+from fishkernel.events import Event
 from fishkernel.tui.app import EventTail, FeedBuffer, TuiApp
 from fishkernel.tui.editor import LineEditor
 from fishkernel.tui.render import (
     MAX_ASSISTANT_LINES,
-    STYLE_ASSISTANT,
-    STYLE_DIM,
     STYLE_TOOL_FAIL,
     STYLE_USER,
     Line,
@@ -341,7 +339,6 @@ def test_render_frame_pins_chat_rows():
 
 def test_chat_area_excludes_tool_noise():
     """聊天区只收人说的话，不收工具调用/任务结算。"""
-    from fishkernel.tui.app import TuiApp
 
     turns = []
     for label, text in [("你", "帮我看看"), ("我", "好的")]:
@@ -438,40 +435,60 @@ def test_poll_keeps_right_pane_in_sync(archive, log):
 
 
 def test_left_pane_wraps_instead_of_truncating(archive, log):
-    """左栏必须折行显示全文，不能截断成省略号。"""
-    from fishkernel.tui.render import display_width
+    """左栏必须折行显示全文，不能截断成省略号。
 
-    from fishkernel.tui.render import wrap_text
+    历史：这里曾有一行 `left_w = max(20, int(100 * app.CHAT_SPLIT) - 1) if False else 41`。
+    `if False` 让右边的 41 生效，左边的分支成了死代码——而它引用的 `app` 在那时
+    还没定义（F821）。只要有人把条件改成 True 就会 NameError。
+    现在宽度从 TuiApp.CHAT_SPLIT 真正推导出来，不再写死数字。
+    """
+    from fishkernel.tui.render import display_width, wrap_text
 
     long_text = "这是一段相当长的中文内容用来验证左栏是否会折行显示全部文字而不是简单截断"
-    left_w = max(20, int(100 * app.CHAT_SPLIT) - 1) if False else 41
-    left_body_w = max(4, left_w - 2)
+    width, height = 100, 30
     log.append("user/message", text=long_text, source="control")
-    app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=30)
+    app = TuiApp(archive.root, snapshot=True, color=False, width=width, height=height)
     app._ensure_primed()
 
+    # 与 _chat_lines() 保持同一套推导：左栏宽 = max(20, int(width*CHAT_SPLIT)-1)
+    left_w = max(20, int(width * TuiApp.CHAT_SPLIT) - 1)
+    prefix = "你│"
+    left_body_w = max(4, left_w - display_width(prefix))
+
     rows = app._snapshot_frame().split("\r\n")
-    left_parts = []
+    # 注意：分隔栏用的 "│" 和左栏标签前缀 "你│" 是同一个字符。
+    # 早先这里写 row.split("│", 1)[0]，切到的是标签"你"本身，于是每条都变成
+    # 空串、被下面的 if not body: continue 全部跳过——整套断言等于没跑。
+    # 必须从右侧切分才能拿到完整的左栏。
+    left_parts: list[str] = []
     for row in rows[1:]:
-        if "│" in row:
-            left_parts.append(row.split("│", 1)[0].rstrip())
-    # 左栏高度有限（只显示末尾几行，前面靠翻页），逐条校验：
+        if "│" not in row:
+            continue
+        left_col = row.rsplit("│", 1)[0]
+        # 去掉标签前缀（"你│" / "我│"），保留正文（含缩进）
+        for label in ("你│", "我│"):
+            if left_col.startswith(label):
+                left_col = left_col[len(label):]
+                break
+        left_parts.append(left_col.rstrip())
+
+    assert left_parts, "没有解析出任何左栏内容，测试前提不成立"
+
     # 1) 不出现省略号 —— 说明是折行而不是截断
     assert "…" not in "".join(left_parts), "左栏不该用省略号截断"
 
-    # 2) 每一行去掉前缀/缩进后，都必须是原文里的连续片段
-    for part in left_parts:
-        body = part.strip().lstrip("你我系统│").strip()
-        if not body:
-            continue
+    # 2) 每一行去掉缩进后，都必须是原文里的连续片段（没被吃字）
+    bodies = [part.strip() for part in left_parts if part.strip()]
+    assert bodies, "左栏解析出内容后全为空，断言会变成空转"
+    for body in bodies:
         assert body in long_text, f"行内容 {body!r} 不在原文中，说明被吃字了"
 
-    # 3) 折行后的总行数应等于按宽度切分的段数（内容完整、没被丢弃）。
-    #    50 字的文本在约 33 格宽下会折成 2 段以上。
-    expected = len(wrap_text(long_text, left_body_w))
-    assert expected >= 2, "测试文本应至少折成 2 行"
-    # 所有可见行（含被高度裁掉的）都应来自原文，上面已逐行校验过
-
+    # 3) 拼回去必须与原文一致：这才证明是「折行」而不是「丢字」。
+    expected_lines = wrap_text(long_text, left_body_w)
+    assert len(expected_lines) >= 2, "这篇宽度下本应折成多行，测试前提不成立"
+    assert bodies == expected_lines, (
+        f"左栏折行结果与预期不符：\n  得到 {bodies!r}\n  期望 {expected_lines!r}"
+    )
 
 def test_wrapped_rows_fit_pane_width(archive, log):
     """折行后每一行都不能超过左栏宽度。"""
@@ -525,3 +542,34 @@ def test_page_step_is_one(archive):
     """PgUp/PgDn 每次翻 1 行，逐行阅读。"""
     app = TuiApp(archive.root, snapshot=True, color=False, width=100, height=40)
     assert app._page_step() == 1
+
+
+def test_snapshot_fills_message_area(archive, log):
+    """快照模式必须把整个消息区填满（height - 4 行）。
+
+    历史：_snapshot_frame() 里算出 `chat = self._chat_lines(w, body_h)` 却没用，
+    传给 render_frame 的是 `self._chat_lines(w)`（没有 height），于是
+    _chat_lines 退化成 CHAT_ROWS or 8 行。render_frame 按 height-4 切片，
+    窗口高 30 时只显示 8 行消息区，剩下 18 行是空白。
+    交互路径一直是传 body_h 的，所以只有 --snapshot 暴露这个问题。
+    """
+    width, height = 100, 30
+    # 塞够多消息，足以填满消息区
+    for index in range(40):
+        log.append("user/message", text=f"第 {index} 条消息", source="control")
+
+    app = TuiApp(archive.root, snapshot=True, color=False, width=width, height=height)
+    app._ensure_primed()
+    rows = app._snapshot_frame().split("\r\n")
+
+    # 1) 总行数符合约定
+    assert len(rows) == height, f"帧高 {len(rows)}，应为 {height}"
+
+    # 2) 除状态/分隔/输入/提示这 4 行外，消息区每一行都必须有左栏内容
+    body = rows[1:height - 3]
+    assert len(body) == height - 4
+    empty = [i for i, row in enumerate(body) if not row.split("│", 1)[0].strip()]
+    assert not empty, (
+        f"消息区有 {len(empty)}/{len(body)} 行是空的（行号 {empty[:5]}）；"
+        "说明 _chat_lines 没拿到正确高度"
+    )

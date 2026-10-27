@@ -1,3 +1,29 @@
+## v0.4.2
+
+用 ruff 扫 `F`（pyflakes）/ `B`（bugbear）两类规则时发现的问题，逐个核实后修复：
+
+- **`--snapshot` 只填满 8 行消息区**（真 bug，用户可见）。`_snapshot_frame()` 里
+  `chat = self._chat_lines(w, body_h)` 算完就丢掉了，真正传给 `render_frame` 的是
+  `self._chat_lines(w)` —— 少了 `height`，`_chat_lines` 退化成 `CHAT_ROWS or 8`。
+  `render_frame` 又按 `height - 4` 切片，于是 30 行的终端里 18 行是空白。
+  交互路径一直传的是 `body_h`，所以只有 `--snapshot` 暴露。
+  实测：消息区有内容的行数 8 → 25（height=30）。
+- **一个测不出任何东西的测试**。`test_left_pane_wraps_instead_of_truncating` 用
+  `row.split("│", 1)[0]` 取左栏，但 `│` 与标签前缀 `你│` 是同一个字符，
+  切出来的是标签本身；去掉标签后全是空串，被 `if not body: continue` 全部跳过，
+  三条断言等于没跑。改为从右侧 `rsplit` 切分，并补上注释里承诺、但从未写出的
+  「折行后拼回去必须等于原文」断言。
+- 同一测试里的 `left_w = max(20, int(100 * app.CHAT_SPLIT) - 1) if False else 41`：
+  `if False` 让左边成为死代码（且引用了当时还不存在的 `app`，F821），
+  只要有人把条件改成 `True` 就会 `NameError`。改为真正从 `CHAT_SPLIT` 推导。
+- 清理 9 处未使用的 import（`control.py`、`test_events.py`、`test_image.py`、
+  `test_tui.py`、`test_web.py`），修一处闭包循环变量捕获（B023）。
+
+新增测试 `test_snapshot_fills_message_area`；两处修复都用「临时还原 bug」验证过
+对应测试确实会失败（快照测试报「消息区有 18/26 行是空的」）。
+
+- 178 -> 179 passed；`ruff check --select F,B,E9` 全绿。
+
 ## v0.4.1
 
 - 修复 `jobs.tick()` 的超时判定在非 +0800 机器上失效：

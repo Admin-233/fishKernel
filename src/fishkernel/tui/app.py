@@ -382,19 +382,25 @@ class TuiApp:
         self._ensure_primed()
         self._rebuild(self._cur_width)
         body_h = max(1, self._cur_height - 4)
+        # 这里的 chat 必须按 body_h 计算并原样传下去。
+        # 曾经写成「算出 chat 却不用，render_frame 里再 _chat_lines(width) 一次」：
+        # 后者拿不到 height，_chat_lines 退化成 CHAT_ROWS or 8 行，
+        # 而 render_frame 又按 height-4 去切片 —— 窗口高 30 行时，
+        # 快照只能显示 8 行消息区，其余 18 行是黑的。
+        # 交互路径（见下方 chat=self._chat_lines(width, body_h)）一直是对的，
+        # 只有快照路径漏了，所以肉眼只在 --snapshot 下看出问题。
         chat = self._chat_lines(self._cur_width, body_h)
-        feed = []
         hint = Line("快照模式 · 去掉 --snapshot 进入交互界面", STYLE_HINT)
         frame, _, _ = render_frame(
             width=self._cur_width,
             height=self._cur_height,
             status=self._status(self._cur_width),
-            feed=feed,
+            feed=[],
             input_text="",
             cursor=0,
             hint=hint,
             color=self.color,
-            chat=self._chat_lines(self._cur_width),
+            chat=chat,
         )
         return frame
 

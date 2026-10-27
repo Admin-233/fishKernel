@@ -120,7 +120,6 @@ def test_parse_cache_invalidated_on_truncate(archive):
 
 def test_parse_cache_invalidated_on_replacement(archive):
     """文件被整体替换（inode 变化）后缓存必须失效。"""
-    import os
     from fishkernel.events import clear_parse_cache, read_events
 
     clear_parse_cache()

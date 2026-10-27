@@ -134,7 +134,9 @@ def test_started_timestamp_is_timezone_independent():
     expected = 1793073600.0  # 2026-10-27T12:00:00+0800 == 04:00:00Z
     for tz in ("Asia/Shanghai", "UTC", "America/New_York"):
         for stamp in ("2026-10-27T12:00:00+0800", "2026-10-27T04:00:00+0000"):
-            got = _with_tz(tz, lambda: _started_timestamp(stamp))
+            # 用默认参数把 stamp 绑死：否则闭包会在调用时才读 stamp，
+            # 一旦 _with_tz 是延迟执行的就是另一个值了。
+            got = _with_tz(tz, lambda s=stamp: _started_timestamp(s))
             assert got == expected, f"TZ={tz} {stamp} -> {got}，应为 {expected}"
 
 
