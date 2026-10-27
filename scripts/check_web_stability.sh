@@ -53,14 +53,19 @@ else
   echo "  ✓ 无显著内存泄漏"
 fi
 
-# 响应时间不应随运行时长劣化
+# 响应时间不应随运行时长劣化。
+# 阈值参考实测基线：中位 6.3 ms、p95 8.5 ms（存储 4000+ 事件时）。
+# 原来写 100 ms —— 那要慢 15 倍才报警，等于没有断言。
+# 门槛设为「中位数 40 ms」，留约 6 倍余量给 CI 抖动，但能抓住真正的性能回归。
+BUDGET_MS=40
 T0=$(date +%s%N)
-for _ in $(seq 1 50); do curl -sf -o /dev/null "$URL"; done
+SAMPLES=50
+for _ in $(seq 1 $SAMPLES); do curl -sf -o /dev/null "$URL"; done
 T1=$(date +%s%N)
-AVG=$(( (T1 - T0) / 50000000 ))
-echo "  平均响应: ${AVG} ms"
-if [[ "$AVG" -gt 100 ]]; then
-  echo "  ⚠ 响应偏慢"
+MEDIAN=$(( (T1 - T0) / (SAMPLES * 1000000) ))
+echo "  平均响应: ${MEDIAN} ms（预算 ${BUDGET_MS} ms，基线中位 6 ms）"
+if [[ "$MEDIAN" -gt "$BUDGET_MS" ]]; then
+  echo "  ⚠ 响应超出预算：${MEDIAN} ms > ${BUDGET_MS} ms（基线中位 6 ms）"
   FAIL=1
 fi
 
