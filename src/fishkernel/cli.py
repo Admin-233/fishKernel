@@ -201,7 +201,14 @@ def _cmd_trim(args) -> int:
             print("已取消。")
             return 0
 
-    path = apply_trim(archive, plan)
+    try:
+        path = apply_trim(archive, plan)
+    except TrimError as exc:
+        # apply_trim 会在内核持锁时拒绝（并发写入会丢事件）。
+        # 必须返回非零退出码，否则脚本调用方会误以为成功。
+        print(f"\n拒绝归档：{exc}", file=sys.stderr)
+        return 1
+
     if path is None:
         print("没有需要归档的事件。")
         return 0
