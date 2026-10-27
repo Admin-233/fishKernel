@@ -1,6 +1,6 @@
 # fishKernel
 
-** DO NOT USE THIS FRAMEWORK, while its maintained completely by LLM, it experimental and unstable, also lack of standardization. **
+**DO NOT USE THIS FRAMEWORK, while its maintained completely by LLM, it's experimental and unstable, also lack of standardization.**
 
 让大模型长时间自主运行的内核。
 
