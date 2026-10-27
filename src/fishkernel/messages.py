@@ -53,8 +53,8 @@ def images_path_of(event: Event) -> str:
 def image_keep_floor(events: list[Event], keep: int = MAX_LIVE_IMAGES) -> int:
     """返回「真图保留区」的起点 seq：seq >= 该值的事件里图片才真正带上。
 
-    从后往前数带图的事件，第 keep 张图的 seq 即为分界线；
-    图片总数不超过 keep 时返回 0，表示一张都不卸载。
+    两道闸：张数上限 keep，以及总估算预算 MAX_LIVE_IMAGE_TOKENS（按张数兜底）。
+    图片总数不超过任何一道时返回 0，表示一张都不卸载。
     """
     seqs = [e.seq for e in events if e.type == "tool/result" and (e.data.get("images") or [])]
     if len(seqs) <= keep:

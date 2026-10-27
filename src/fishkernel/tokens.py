@@ -32,6 +32,14 @@ _NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
 PER_MESSAGE_OVERHEAD = 4
 PER_TOOL_OVERHEAD = 16
 
+# 一张普通截图的视觉 token 估算值。
+# 关键教训：绝不能按 base64 字符数估算图片开销——
+# 一张 1100x649 的 PNG 的 data URL 有 60 万字符，按文本算约 18 万 token，
+# 而模型实际只计几百到一千多。误差 200 倍，会直接把压缩的保留预算吃光，
+# 导致「一个单元就超预算 → 兜底 kept=1 → 前面所有历史被摘要掉」。
+IMAGE_TOKEN_ESTIMATE = 1000
+_DATA_URL_RE = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
 
 def _char_cost(ch: str) -> float:
     code = ord(ch)
@@ -61,9 +69,17 @@ def estimate_text(text: str) -> int:
     if not text:
         return 0
 
+    # 兜底：任何路径带进来的 data URL 都按「一张图」计价，绝不按 base64 长度算
+    image_cost = 0
+    if "data:image/" in text:
+        text, removed = _DATA_URL_RE.subn("", text)
+        image_cost = removed * IMAGE_TOKEN_ESTIMATE
+        if not text:
+            return image_cost
+
     # re 的 C 实现只扫一遍，比 Python 层逐字符快一个数量级
     if text.isascii():
-        return math.ceil(len(text) * 0.3)
+        return math.ceil(len(text) * 0.3) + image_cost
 
     total_len = len(text)
     # sub 把非 ASCII 换成空，剩下的就是 ASCII 部分
@@ -72,7 +88,7 @@ def estimate_text(text: str) -> int:
     other_count = total_len - ascii_count - cjk_count
 
     total = ascii_count * 0.3 + cjk_count * 0.6 + other_count * 0.5
-    return math.ceil(total)
+    return math.ceil(total) + image_cost
 
 
 def estimate_message(message: dict[str, Any]) -> int:
@@ -81,7 +97,15 @@ def estimate_message(message: dict[str, Any]) -> int:
     if isinstance(content, str):
         total += estimate_text(content)
     elif isinstance(content, list):
-        total += estimate_text(json.dumps(content, ensure_ascii=False))
+        # 逐块处理：image_url 块按「一张图」计价，其余文本照常估算。
+        # 早期实现是 json.dumps 整个列表再估文本，图片的 base64 会被当文本算。
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                total += IMAGE_TOKEN_ESTIMATE
+            else:
+                total += estimate_text(
+                    json.dumps(part, ensure_ascii=False) if not isinstance(part, str) else part
+                )
     for call in message.get("tool_calls") or []:
         function = call.get("function") or {}
         total += estimate_text(str(function.get("name", "")))

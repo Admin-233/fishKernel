@@ -130,8 +130,11 @@ class Compressor:
         while kept < len(units) and kept_tokens + unit_tokens[len(units) - 1 - kept] <= retain_budget:
             kept_tokens += unit_tokens[len(units) - 1 - kept]
             kept += 1
+        oversized_tail = kept == 0
         if kept == 0:
-            # 最新一个单元就超过保留预算：仍然保留它，压缩其余部分
+            # 最新一个单元就超过保留预算：仍然保留它，压缩其余部分。
+            # 危险情况：一旦最新单元异常巨大（例如把图片 base64 当文本估算），
+            # 就会把整份历史一次性摘要掉。这里显式记录，便于事后定位。
             kept = 1
             kept_tokens = unit_tokens[-1]
         if kept >= len(units):
@@ -152,6 +155,8 @@ class Compressor:
             region_units=len(region_units),
             retained_units=kept,
             retained_tokens=kept_tokens,
+            retained_oversized=oversized_tail,
+            retain_budget=retain_budget,
         )
 
         summary_max_tokens = min(SUMMARY_MAX_TOKENS_CAP, max(256, retain_budget // 8))

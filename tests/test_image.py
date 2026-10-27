@@ -160,3 +160,83 @@ def test_image_keep_floor():
     # 超上限 → 分界线是倒数第 keep 张
     events = [img(1), img(2), img(3), plain(4), img(5)]
     assert image_keep_floor(events, keep=2) == 3
+
+
+# ---- 图片 token 估算（2026-10-27 事故回归） ----
+# 事故：一张 1100x649 的截图 data URL 有 60 万字符，被 estimate_text 当文本算成
+# 18 万 token，超过压缩的保留预算 166461 → 触发 kept=1 兜底 → 1355 个会话单元
+# 被一次性摘要掉。图片必须按「张」计价，绝不能按 base64 字符数计价。
+
+
+def test_estimate_text_ignores_base64_length():
+    from fishkernel.tokens import IMAGE_TOKEN_ESTIMATE, estimate_text
+
+    b64 = "A" * 600_000
+    url = f"data:image/png;base64,{b64}"
+    cost = estimate_text(url)
+    assert cost == IMAGE_TOKEN_ESTIMATE
+    # 绝不能按字符数算（那会是 18 万）
+    assert cost < 5000
+
+
+def test_estimate_message_counts_image_block_as_one_image():
+    from fishkernel.tokens import IMAGE_TOKEN_ESTIMATE, estimate_message
+
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "看图"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 600_000}},
+        ],
+    }
+    cost = estimate_message(message)
+    assert cost < 5000
+    assert cost >= IMAGE_TOKEN_ESTIMATE
+
+
+def test_image_message_estimate_is_stable_regardless_of_image_size():
+    from fishkernel.tokens import estimate_message
+
+    def cost(chars: int) -> int:
+        return estimate_message(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * chars}}
+                ],
+            }
+        )
+
+    assert cost(1_000) == cost(800_000)
+
+
+def test_compaction_keeps_more_units_when_tail_has_image(archive, monkeypatch):
+    """带有大图的尾部单元不该把保留预算吃光。"""
+    from fishkernel import compress as compress_mod
+    from fishkernel.messages import build_messages as bm
+    from fishkernel.tokens import estimate_messages
+
+    log = EventLog(archive.events_path).open()
+    log.append("user/message", source="user", text="开始")
+    for index in range(6):
+        log.append("assistant/message", text=f"第{index}轮回复", reasoning="", tool_calls=[])
+        log.append("user/message", source="user", text=f"第{index}轮提问")
+    # 最后一条工具结果带一张 60 万字符 base64 的图
+    log.append(
+        "assistant/message",
+        text="",
+        reasoning="",
+        tool_calls=[{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+    )
+    log.append(
+        "tool/result",
+        call_id="c1",
+        name="read_file",
+        ok=True,
+        output=json.dumps({"ok": True, "kind": "image"}, ensure_ascii=False),
+        images=[{"url": "data:image/png;base64," + "A" * 600_000, "path": "/tmp/x.png", "format": "png"}],
+    )
+
+    events = read_events(archive.events_path)
+    messages = bm(events, "sys")
+    assert estimate_messages(messages) < 50_000  # 不算图片 base64 的话总量很小
