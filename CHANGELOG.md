@@ -1,3 +1,21 @@
+## v0.4.4
+
+- 版本号改为单一来源（`__init__.py` 是真源，pyproject 用 setuptools dynamic attr）。
+  此前 CHANGELOG 已写到 v0.4.3，但两处都停在 0.3.0，`fishkernel --version` 一直报旧版本。
+  新增 `tests/test_version.py` 三项护栏：版本格式、pyproject 不得写死 version、
+  CHANGELOG 顶部版本必须等于包版本。
+- 新增 `tests/test_crash_recovery.py`（4 项）——把「崩了重启能接着跑」这条核心承诺
+  从人工试跑变成自动化测试。之前的单测只覆盖零件（`truncate_partial_tail`、
+  `recover_stale`、`TOOL_OUTCOME_UNKNOWN`），没有端到端验证：
+  - SIGKILL 之后重启，seq 必须接着涨而不是从 1 重来；
+  - 重启要记下第二次 `session/start`；
+  - 日志末尾半行要能被截断，且不产生 seq 缺口；
+  - 孤儿 `tool_call` 要被补上 `TOOL_OUTCOME_UNKNOWN`，否则 API 直接报错。
+  测试真的起子进程、真的 `kill -9`、真的重启——mock 掉进程就等于没测。
+  把 `EventLog.open()` 的 seq 基线改成 0，前三条立刻变红（`At index 121 diff: 1 != 122`）。
+
+- 204 -> 208 passed。
+
 ## v0.4.3
 
 - **修复长期记忆在压缩时静默丢失**（数据丢失，严重）。`Compressor._flush_pending_memory()`
