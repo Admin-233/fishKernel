@@ -132,3 +132,66 @@ def test_parse_cache_invalidated_on_replacement(archive):
     from fishkernel.atomic import write_atomic
     write_atomic(archive.events_path, '{"seq":1,"ts":"","type":"user/message","data":{"text":"new"}}\n')
     assert [e.data["text"] for e in read_events(archive.events_path)] == ["new"]
+
+
+# ---- 事件日志中段损坏 ---------------------------------------------------------
+# 前面测过末尾半行（写入中被杀）。但还有一种情况：中间某一行损坏（磁盘坏道、
+# 手工编辑失误、拷贝出错）。此时应当：
+#   1. 跳过损坏行，后续正常事件仍能读到（不能整个文件读不了）
+#   2. seq 基线取自**最后一条有效事件**，新事件不能与已有的 seq 冲突
+
+
+def test_corrupted_middle_line_is_skipped(archive):
+    from fishkernel.events import clear_parse_cache, read_events
+
+    path = archive.events_path
+    lines = [
+        json.dumps({"seq": i + 1, "ts": "", "type": "user/message", "data": {"text": f"m{i}"}},
+                   ensure_ascii=False)
+        for i in range(10)
+    ]
+    lines[4] = '{"seq":5,"ts":"","type":"user/mes'      # 中段损坏
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    clear_parse_cache(path)
+
+    events = read_events(path)
+    assert len(events) == 9, "损坏行应被跳过，其余事件仍可读"
+    assert [e.seq for e in events] == [1, 2, 3, 4, 6, 7, 8, 9, 10], "跳过后 seq 有缺口但顺序正确"
+
+
+def test_seq_baseline_after_middle_corruption(archive):
+    """中段损坏后，新事件不能与已有 seq 重复。"""
+    from fishkernel.events import EventLog, _last_seq, clear_parse_cache, read_events
+
+    path = archive.events_path
+    lines = [
+        json.dumps({"seq": i + 1, "ts": "", "type": "user/message", "data": {"text": f"m{i}"}},
+                   ensure_ascii=False)
+        for i in range(10)
+    ]
+    lines[4] = "not json at all"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    clear_parse_cache(path)
+
+    assert _last_seq(path) == 10, "基线应取自最后一条有效事件，而不是有效条数"
+
+    with EventLog(path).open() as log:
+        event = log.append("user/message", text="新消息")
+    assert event.seq == 11
+
+    clear_parse_cache(path)
+    seqs = [e.seq for e in read_events(path)]
+    assert len(seqs) == len(set(seqs)), f"seq 出现重复：{seqs}"
+
+
+def test_all_lines_corrupted(archive):
+    """全部损坏时不应崩溃，且基线安全地落回 0。"""
+    from fishkernel.events import EventLog, read_events, clear_parse_cache
+
+    path = archive.events_path
+    path.write_text("garbage\nmore garbage\n", encoding="utf-8")
+    clear_parse_cache(path)
+
+    assert read_events(path) == []
+    with EventLog(path).open() as log:
+        assert log.append("user/message", text="x").seq == 1
