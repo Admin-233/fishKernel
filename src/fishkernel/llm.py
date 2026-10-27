@@ -197,6 +197,35 @@ def _parse_completion(response: Any, model: str) -> Completion:
             value = getattr(usage_raw, key, None)
             if isinstance(value, int):
                 usage[key] = value
+
+        # 缓存命中/未命中：DeepSeek 会把这两个单列出来。
+        # 命中部分单价低一个数量级，不记录就无法估算真实成本。
+        # 实测同一段长前缀连续请求，第二次命中率可达 90%。
+        for key in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+            value = getattr(usage_raw, key, None)
+            if isinstance(value, int):
+                usage[key] = value
+
+        # 兼容 OpenAI 风格：prompt_tokens_details.cached_tokens
+        if "prompt_cache_hit_tokens" not in usage:
+            details = getattr(usage_raw, "prompt_tokens_details", None)
+            cached = getattr(details, "cached_tokens", None) if details is not None else None
+            if isinstance(cached, int):
+                usage["prompt_cache_hit_tokens"] = cached
+                if isinstance(usage.get("prompt_tokens"), int):
+                    usage["prompt_cache_miss_tokens"] = max(
+                        0, usage["prompt_tokens"] - cached
+                    )
+
+        # 推理 token（reasoning 是 output 的子集，单独记便于观察）
+        comp_details = getattr(usage_raw, "completion_tokens_details", None)
+        reasoning_tokens = (
+            getattr(comp_details, "reasoning_tokens", None)
+            if comp_details is not None
+            else None
+        )
+        if isinstance(reasoning_tokens, int):
+            usage["reasoning_tokens"] = reasoning_tokens
     return Completion(
         text=text,
         reasoning=reasoning,

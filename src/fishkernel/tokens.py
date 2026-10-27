@@ -220,3 +220,97 @@ class TokenMeter:
             f"锚点 prompt={self._anchor.prompt_tokens}（自 seq {self._anchor.prompt_seq} 起），"
             f"估算比例 {self._ratio:.2f}，样本 {self._samples}"
         )
+
+
+# ---- 用量与成本统计 ----
+# DeepSeek 定价（元 / 百万 token），按 2026 年标准档。改价时只需改这里。
+PRICE_CACHE_HIT = 0.5      # 命中缓存的输入
+PRICE_CACHE_MISS = 4.0     # 未命中的输入
+PRICE_OUTPUT = 12.0        # 输出（含推理 token）
+
+
+@dataclass
+class UsageTotals:
+    """把一串 assistant/message 的 usage 聚合成可读的用量与成本。"""
+
+    calls: int = 0
+    prompt_tokens: int = 0
+    cache_hit: int = 0
+    cache_miss: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    calls_without_cache_data: int = 0
+
+    @property
+    def cache_hit_rate(self) -> float:
+        denom = self.cache_hit + self.cache_miss
+        return (self.cache_hit / denom) if denom else 0.0
+
+    @property
+    def cost_yuan(self) -> float:
+        """按当前定价估算花费。
+
+        注意：大量老记录没有缓存字段（实现里曾经漏记）。直接把这些 prompt
+        全按未命中价算会严重高估——实测命中率是 99.9%，全价算能差出几十倍。
+        所以对「无缓存数据的调用」用已观测到的命中率来估，没有观测值时
+        退化为保守的 0.9（DeepSeek 长前缀场景实测值）。
+        """
+        # 有缓存数据的部分：按实际命中/未命中分别计价
+        hit = self.cache_hit
+        miss = self.cache_miss
+        # 无缓存数据的部分：用观测命中率外推
+        unknown_prompt = max(0, self.prompt_tokens - hit - miss)
+        if unknown_prompt:
+            rate = self.cache_hit_rate if (hit + miss) else 0.9
+            hit += int(unknown_prompt * rate)
+            miss += int(unknown_prompt * (1 - rate))
+        return (
+            hit * PRICE_CACHE_HIT
+            + miss * PRICE_CACHE_MISS
+            + self.output_tokens * PRICE_OUTPUT
+        ) / 1_000_000
+
+    def summary(self) -> str:
+        parts = [f"{self.calls} 次调用"]
+        if self.prompt_tokens:
+            parts.append(f"输入 {self.prompt_tokens:,}")
+        # 只在「有缓存样本」时才报命中率，并显式标出样本范围，
+        # 否则 42 条样本的 99.9% 会被误读成全局比例。
+        sampled = self.calls - self.calls_without_cache_data
+        if sampled:
+            if sampled < self.calls:
+                parts.append(f"缓存命中 {self.cache_hit_rate:.0%}（{sampled}/{self.calls} 条有数据）")
+            else:
+                parts.append(f"缓存命中 {self.cache_hit_rate:.0%}")
+        parts.append(f"输出 {self.output_tokens:,}")
+        parts.append(f"约 ¥{self.cost_yuan:.2f}")
+        return " · ".join(parts)
+
+
+def fold_usage(events) -> UsageTotals:
+    """从事件里折叠出累计用量。events 需含 assistant/message 的 usage。"""
+    totals = UsageTotals()
+    for event in events:
+        if event.type != "assistant/message":
+            continue
+        usage = event.data.get("usage") or {}
+        prompt = usage.get("prompt_tokens")
+        if not isinstance(prompt, int):
+            continue
+        totals.calls += 1
+        totals.prompt_tokens += prompt
+        hit = usage.get("prompt_cache_hit_tokens")
+        miss = usage.get("prompt_cache_miss_tokens")
+        if isinstance(hit, int):
+            totals.cache_hit += hit
+        if isinstance(miss, int):
+            totals.cache_miss += miss
+        if hit is None:
+            totals.calls_without_cache_data += 1
+        output = usage.get("completion_tokens")
+        if isinstance(output, int):
+            totals.output_tokens += output
+        reasoning = usage.get("reasoning_tokens")
+        if isinstance(reasoning, int):
+            totals.reasoning_tokens += reasoning
+    return totals
