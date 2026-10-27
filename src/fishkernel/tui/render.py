@@ -312,11 +312,18 @@ def status_line(
     prompt_total: int,
     jobs_running: int,
     width: int,
+    cost_yuan: float | None = None,
 ) -> Line:
-    text = (
-        f" fishKernel · {name} · {run_word} · 第 {turn} 轮 · {model} · "
-        f"压力 {_fmt_int(pressure)}/{_fmt_int(threshold)} · 用量 {_fmt_int(prompt_total)} · 任务 {jobs_running} "
-    )
+    parts = [
+        f" fishKernel · {name} · {run_word} · 第 {turn} 轮 · {model}",
+        f"压力 {_fmt_int(pressure)}/{_fmt_int(threshold)}",
+        f"用量 {_fmt_int(prompt_total)}",
+    ]
+    # 成本比 token 数直观：用户真正关心的是余额还剩多少
+    if cost_yuan is not None:
+        parts.append(f"¥{cost_yuan:.2f}")
+    parts.append(f"任务 {jobs_running}")
+    text = " · ".join(parts) + " "
     return Line(text, STYLE_STATUS)
 
 

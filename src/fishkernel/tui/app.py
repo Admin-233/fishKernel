@@ -355,7 +355,18 @@ class TuiApp:
             prompt_total=self._prompt_total,
             jobs_running=self._jobs_running,
             width=width,
+            cost_yuan=self._cost_yuan(),
         )
+
+    def _cost_yuan(self) -> float | None:
+        """累计花费。事件里没有 usage 时返回 None（状态栏就不显示）。"""
+        try:
+            from ..tokens import fold_usage
+
+            total = fold_usage(self.events)
+            return total.cost_yuan if total.calls else None
+        except Exception:  # noqa: BLE001 - 状态栏不能因为统计失败而崩
+            return None
 
     def _hint(self) -> Line:
         flash, expires = self._flash
