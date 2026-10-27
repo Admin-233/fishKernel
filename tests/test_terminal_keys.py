@@ -10,7 +10,6 @@ terminal.py 整体覆盖率低是因为大量平台相关代码（termios / msvc
 
 from __future__ import annotations
 
-import pytest
 
 from fishkernel.tui.terminal import Terminal
 
