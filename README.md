@@ -244,6 +244,10 @@ fishKernel/
 └── pyproject.toml
 ```
 
+## 经验文档
+
+踩过的坑与通用解药：[docs/lessons.md](docs/lessons.md) —— 13 个「静默失效」实战案例。
+
 ## 已知限制
 
 1. 一个存档只能跑一个内核实例：现在有文件锁强制，第二个会报 `LockError`（交班重启除外）。
