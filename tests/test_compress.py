@@ -345,3 +345,62 @@ def test_normal_compaction_still_works_after_abort(archive, config, log):
     outcome = Compressor(archive, config, good, log).compact(retain_override=50)
     assert outcome.compacted is True
     assert outcome.reason == "ok"
+
+
+# ---- 压缩区外有更新记忆时不得回退 -------------------------------------------
+# 真实事故（2026-10-27）：压缩只处理「压缩区内」的 memory/write。如果之后在保留区
+# 又用 memory 工具改过记忆，那些内容不在 pending 里，却是更新的事实。
+# 此时若按 pending 里的旧 replace 覆盖磁盘，就把更新的记忆打回了旧版。
+#
+# 实测：磁盘 3686 字符的完整记忆，压缩区内只有 seq 48/498 两个旧 replace
+# （合计 1620 字符），压缩后磁盘被覆盖成旧版。而最新的 replace(seq 3028)
+# 因为"还在上下文里"反而被跳过 —— 越新越容易丢，非常反直觉。
+
+
+def _write_memory(archive, content: str, seq: int, mode: str = "replace"):
+    from fishkernel.events import Event
+
+    return Event(seq, "", "memory/write", {"mode": mode, "content": content})
+
+
+def test_flush_skips_when_newer_memory_exists_outside_region(archive, log):
+    """压缩区外有更新记忆时，一个字都不许写。"""
+    disk_now = "# 磁盘上的最新完整记忆\n" + "重要内容。" * 50
+    archive.write_long_term_memory(disk_now)
+
+    # 事件流：旧 replace 在前，更新的 replace 在后（后者不在 pending 里）
+    log.append("memory/write", mode="replace", content="旧版记忆")
+    log.append("memory/write", mode="replace", content=disk_now)
+
+    from fishkernel.events import read_events
+
+    events = read_events(archive.events_path)
+    region = [events[0]]          # 只有第一条在压缩区里
+    compressor = _flusher(archive)
+
+    written = compressor._flush_pending_memory(region)
+    assert written == 0, "压缩区外有更新记忆时不应落盘"
+    assert archive.read_text(archive.long_term_memory_path).strip() == disk_now.strip()
+
+
+def test_flush_still_writes_when_region_has_newest(archive, log):
+    """没有更新记忆时，正常落盘行为不变。"""
+    log.append("memory/write", mode="replace", content="这是最新的记忆")
+    from fishkernel.events import read_events
+
+    events = read_events(archive.events_path)
+    compressor = _flusher(archive)
+    assert compressor._flush_pending_memory(events) == 1
+    assert "这是最新的记忆" in archive.read_text(archive.long_term_memory_path)
+
+
+def test_has_newer_memory_write_detects_correctly(archive, log):
+    log.append("memory/write", mode="replace", content="第一版")
+    log.append("memory/write", mode="append", content="后来的")
+    from fishkernel.events import read_events
+
+    events = read_events(archive.events_path)
+    compressor = _flusher(archive)
+
+    assert compressor._has_newer_memory_write([events[0]]) is True
+    assert compressor._has_newer_memory_write(events) is False

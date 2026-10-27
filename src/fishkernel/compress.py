@@ -293,6 +293,25 @@ class Compressor:
         )
 
         current = self.archive.read_text(self.archive.long_term_memory_path)
+
+        # 关键检查：压缩区之外是否还有更新的 memory/write？
+        #
+        # 事故背景：压缩只处理「压缩区内」的事件。如果之后（在保留区里）用户又用
+        # memory 工具改过记忆，那些内容不会进 pending，却已经是更新的事实。
+        # 此时若按 pending 里的旧 replace 覆盖磁盘，就会把更新的记忆打回旧版。
+        #
+        # 我实际踩到过：磁盘上是手写整理的 3686 字符完整记忆，压缩区内只有
+        # seq 48 / 498 两个旧 replace（合计 1620 字符），压缩后磁盘被覆盖成旧版。
+        #
+        # 判断方式：看事件流里最后一个 memory/write 的 seq 是否大于本批最大的 seq。
+        newer_exists = self._has_newer_memory_write(region_events)
+        if newer_exists:
+            # 更新的记忆还在保留区里，磁盘内容才是最新的：本批一个字都不写。
+            self._log(
+                "压缩区外还有更新的 memory/write，跳过落盘以避免回退（磁盘内容已是最新）"
+            )
+            return 0
+
         extra = "\n\n".join(parts)
         if replaced:
             # 有 replace：以它为准，不保留磁盘上的旧内容
@@ -302,6 +321,21 @@ class Compressor:
             updated = (base + "\n\n" + extra + "\n") if base else (extra + "\n")
         self.archive.write_long_term_memory(updated)
         return len(pending)
+
+    def _has_newer_memory_write(self, region_events: list[Event]) -> bool:
+        """压缩区之外是否还存在比本批更新的 memory/write 事件。"""
+        if not region_events:
+            return False
+        last_region_seq = max(event.seq for event in region_events
+                              if event.type == "memory/write")
+        try:
+            events = read_events(self.archive.events_path)
+        except Exception:
+            return False
+        for event in events:
+            if event.type == "memory/write" and event.seq > last_region_seq:
+                return True
+        return False
 
     def _commit(
         self,
