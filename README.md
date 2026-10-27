@@ -246,8 +246,6 @@ fishKernel/
 
 ## 经验文档
 
-踩过的坑与通用解药：[docs/lessons.md](docs/lessons.md) —— 13 个「静默失效」实战案例。
-
 ## 已知限制
 
 1. 一个存档只能跑一个内核实例：现在有文件锁强制，第二个会报 `LockError`（交班重启除外）。
@@ -257,7 +255,10 @@ fishKernel/
 5. 非流式请求：单次调用最长等 300 秒，期间看不到进度。
 6. 只在 Linux/arm64 上验证过；Windows 分支（`taskkill` 杀进程组）未测。
 7. 网页控制台已实现（`fishkernel web`），桌面 GUI 未实现（控制面已全部落在文件上，接 UI 不需要改内核）。
-8. 压缩只保证“更短”，不保证摘要信息不丢；摘要质量未评测。
+8. 压缩只保证"更短"，不保证摘要信息不丢；**摘要质量仍未评测**。
+   已做过的验证：用真实存档跑完整压缩演练（454K → 169K tokens，降 63%），
+   确认 tool_call 全部配对、摘要正确注入、长期记忆完整保留。
+   但这些只验证了"结构完整"，没有评估"摘要是否抓住了重点"。
 9. TUI 只读事件流，不支持鼠标/搜索；长事件只显示摘要，完整内容看 `events.jsonl`。
 
 ## 文档
@@ -270,4 +271,5 @@ fishKernel/
 - [docs/operations.md](docs/operations.md) — 运行、监控、恢复、清理
 - [docs/testing.md](docs/testing.md) — 测试与部署
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 实现规范
+- [docs/lessons.md](docs/lessons.md) — 13 个「静默失效」实战案例与通用解药
 - [KernelDesign.md](KernelDesign.md) — 最初的设计稿
