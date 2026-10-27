@@ -202,3 +202,83 @@ def test_flush_ignores_blank_content(archive):
     compressor._flush_pending_memory(_memory_events(("append", "   "), ("replace", "")))
     # 全是空白 → 不该生成文件内容，也不该抛异常
     assert archive.read_text(archive.long_term_memory_path).strip() == ""
+
+
+# ---- 超大尾部（oversized_tail）边界 ----------------------------------------
+# 保留逻辑是：从最新单元往回累加，直到不超过 retain 预算。如果**最新一个单元本身**
+# 就超过预算，循环一次都不进，kept=0，于是走兜底 kept=1，并记 oversized_tail=True。
+# 这意味着它前面的所有正常对话都会被一次性摘要掉。
+#
+# 这不是崩溃，但代价会被严重低估：一条 12 万 token 的用户消息（比如贴了一大段日志）
+# 就能把之前几十轮正常对话全部送进摘要。至少要保证：
+#   1) 兜底一定保住最新单元，不会出现「最新消息被压缩掉」；
+#   2) 事件里留下 oversized_tail 标记，事后能定位；
+#   3) 最新单元确实不进入压缩区（to_seq 不包括它）。
+
+
+def _seed_turns(log, count: int):
+    for index in range(count):
+        log.append("user/message", text=f"小问题 {index}")
+        log.append("assistant/message", text=f"小回答 {index}")
+
+
+def test_oversized_tail_keeps_newest_unit(archive, config, log):
+    _seed_turns(log, 5)
+    log.append("user/message", text="巨大内容" + "字" * 200_000)
+
+    client = ScriptedClient(
+        [Completion(text="## 主要请求与意图\n压缩了旧对话。", usage={"prompt_tokens": 100, "completion_tokens": 10})]
+    )
+    compressor = Compressor(archive, config, client, log)
+    # retain_override 给小，保证最新那条一定超预算
+    outcome = compressor.compact(retain_override=4096)
+    assert outcome.compacted is True
+
+    events = read_events(archive.events_path)
+    start = next(event for event in events if event.type == "compaction/start")
+    assert start.data["retained_oversized"] is True, "应标记 oversized_tail"
+    assert start.data["retained_units"] == 1
+
+    # 最新那条 user 消息绝不能进压缩区
+    summary = next(event for event in events if event.type == "compaction/summary")
+    to_seq = summary.data["to_seq"]
+    newest_seq = max(event.seq for event in events if event.type == "user/message")
+    assert newest_seq > to_seq, "最新的用户消息被压缩掉了"
+
+
+def test_oversized_tail_region_ends_before_newest(archive, config, log):
+    """大消息之前的正常对话确实会被压缩——把这个代价显式钉住。
+
+    这里不是在为「损失」背书，而是让行为可观测：如果将来改进到能保留更多，
+    这条断言会失败并提醒更新预期。
+    """
+    _seed_turns(log, 5)
+    log.append("user/message", text="巨大内容" + "字" * 200_000)
+
+    client = ScriptedClient(
+        [Completion(text="## 主要请求与意图\n旧对话摘要。", usage={"prompt_tokens": 100, "completion_tokens": 10})]
+    )
+    compressor = Compressor(archive, config, client, log)
+    compressor.compact(retain_override=4096)
+
+    events = read_events(archive.events_path)
+    start = next(event for event in events if event.type == "compaction/start")
+    # 5 轮正常对话 = 10 个单元，全部进入压缩区
+    assert start.data["region_units"] == 10
+    assert start.data["retained_units"] == 1
+
+
+def test_normal_tail_retains_within_budget(archive, config, log):
+    """没有超大单元时，保留应该按预算尽量多留，且不误标 oversized_tail。"""
+    _seed_turns(log, 5)
+    client = ScriptedClient(
+        [Completion(text="## 主要请求与意图\n摘要。", usage={"prompt_tokens": 100, "completion_tokens": 10})]
+    )
+    compressor = Compressor(archive, config, client, log)
+    compressor.compact(retain_override=20)   # 小预算：大约够留两条
+
+    events = read_events(archive.events_path)
+    start = next(event for event in events if event.type == "compaction/start")
+    assert start.data["retained_oversized"] is False
+    assert start.data["retained_units"] >= 1
+    assert start.data["region_units"] + start.data["retained_units"] == 10
