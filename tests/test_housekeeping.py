@@ -97,3 +97,56 @@ def test_hook_runs_when_backup_stale(tmp_path, log):
 
     _make_loop(archive, log)._run_housekeeping()
     assert marker.is_file(), "备份过期时应当执行钩子"
+
+
+def test_hook_runs_when_backup_stale_by_content(tmp_path, log):
+    """时间没到、但备份落后于最新提交时，钩子仍要执行。
+
+    真实 bug（2026-10-27）：前置过滤只看时间戳，备份是 1 分钟前
+    （< 55 分钟）就直接 return，于是「内容驱动」永远触发不了 ——
+    刚提交完代码，备份就一直落后，直到 55 分钟过去才补上。
+    实测：提交后等了 60 秒、内核跑了多轮，备份时间戳纹丝不动。
+    """
+
+    archive = create_archive(tmp_path / "a", name="t", api_key="sk-t")
+    marker = tmp_path / "ran.txt"
+    work = archive.root / "Work"
+    work.mkdir(parents=True, exist_ok=True)
+
+    # 钩子脚本
+    (work / "periodic.sh").write_text(
+        f'#!/usr/bin/env bash\necho yes >> "{marker}"\n', encoding="utf-8")
+    (work / "periodic.sh").chmod(0o755)
+
+    # check_fresh.sh：故意返回失败（模拟「备份落后」）
+    (work / "check_fresh.sh").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    (work / "check_fresh.sh").chmod(0o755)
+
+    # 备份时间戳是刚刚 —— 时间维度上「不需要备份」
+    now = int(time.time())
+    (work / ".last_periodic").write_text(f"backup={now}\nidentity={now}\n", encoding="utf-8")
+
+    _make_loop(archive, log)._run_housekeeping()
+    assert marker.is_file(), "备份落后时应当执行钩子，但前置过滤只看时间就 return 了"
+
+
+def test_hook_skipped_when_time_fresh_and_content_fresh(tmp_path, log):
+    """时间没到且备份是最新的 → 确实不用跑（避免每轮 fork）。"""
+    archive = create_archive(tmp_path / "a", name="t", api_key="sk-t")
+    marker = tmp_path / "ran.txt"
+    work = archive.root / "Work"
+    work.mkdir(parents=True, exist_ok=True)
+
+    (work / "periodic.sh").write_text(
+        f'#!/usr/bin/env bash\necho yes >> "{marker}"\n', encoding="utf-8")
+    (work / "periodic.sh").chmod(0o755)
+
+    # check_fresh.sh 返回成功（备份是最新的）
+    (work / "check_fresh.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (work / "check_fresh.sh").chmod(0o755)
+
+    now = int(time.time())
+    (work / ".last_periodic").write_text(f"backup={now}\nidentity={now}\n", encoding="utf-8")
+
+    _make_loop(archive, log)._run_housekeeping()
+    assert not marker.is_file(), "时间和内容都新鲜时不该执行钩子"

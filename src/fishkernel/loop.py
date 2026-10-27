@@ -291,7 +291,20 @@ class Kernel:
                     default=0,
                 )
                 if newest and time.time() - newest < 55 * 60:
-                    return
+                    # 时间还没到 —— 但可能「备份落后于最新提交」。
+                    # 之前只按时间过滤，导致内容驱动的备份永远触发不了：
+                    # 刚提交完代码，备份时间是 1 分钟前（< 55 分钟），
+                    # 于是每轮都在这儿 return，periodic.sh 根本没机会跑。
+                    # 现在额外看一眼 check_fresh.sh 的结果。
+                    fresh = hook.parent / "check_fresh.sh"
+                    if not fresh.is_file():
+                        return
+                    probe = subprocess.run(
+                        ["bash", str(fresh)], capture_output=True, text=True,
+                        timeout=30, cwd=str(hook.parent),
+                    )
+                    if probe.returncode == 0:
+                        return          # 备份都是最新的，确实不用跑
         except Exception:
             pass                        # 时间戳读不出来就跑一次，宁可多跑
 
