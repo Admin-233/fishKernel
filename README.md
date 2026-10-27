@@ -1,5 +1,7 @@
 # fishKernel
 
+** DO NOT USE THIS FRAMEWORK, while its maintained completely by LLM, it experimental and unstable, also lack of standardization. **
+
 让大模型长时间自主运行的内核。
 
 一句话概括：**存档目录是唯一状态，内核只是「读存档 → 调模型 → 执行工具 → 写回存档」的无限循环。**
