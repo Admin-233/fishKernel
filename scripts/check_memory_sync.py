@@ -27,6 +27,25 @@ import sys
 from pathlib import Path
 
 
+def replay(writes: list[dict]) -> str:
+    """按 seq 顺序回放 memory/write，得到磁盘应有的内容。
+
+    规则与内核的 _flush_pending_memory 一致：replace 覆盖此前全部，append 追加。
+    """
+    state = ""
+    for event in writes:
+        data = event.get("data") or {}
+        mode = str(data.get("mode") or "append")
+        content = str(data.get("content") or "")
+        if not content.strip():
+            continue
+        if mode == "replace":
+            state = content
+        else:
+            state = (state.rstrip() + "\n\n" + content) if state.strip() else content
+    return state.strip()
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"用法：{argv[0]} <存档目录>", file=sys.stderr)
@@ -45,6 +64,7 @@ def main(argv: list[str]) -> int:
     last_replace = None
     replace_count = 0
     append_count = 0
+    writes: list[dict] = []
     for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
@@ -55,6 +75,7 @@ def main(argv: list[str]) -> int:
             continue
         if event.get("type") != "memory/write":
             continue
+        writes.append(event)
         data = event.get("data") or {}
         if data.get("mode") == "replace":
             replace_count += 1
@@ -73,8 +94,15 @@ def main(argv: list[str]) -> int:
     content = str(last_replace.get("data", {}).get("content") or "")
     print(f"  最后一个 replace：seq {last_replace.get('seq')}，{len(content)} 字符")
 
-    if content.strip() == disk.strip():
-        print("  ✓ 一致 —— 压缩时不会改变记忆")
+    # 判断标准必须和 sync_memory.sh 一致：比对「按 seq 回放全部 memory/write」的结果。
+    #
+    # 早先这里只比对最后一个 replace 的内容，导致和 sync_memory.sh 打架：
+    # 如果最后一个 replace 之后还有 append，回放结果 = replace + append，
+    # 而这里拿 replace 原文去比，必然报不一致 —— 两个工具一个说 ✓ 一个说 ✗，
+    # 看的人（包括我自己）会不知道信哪个。
+    replayed = replay(writes)
+    if replayed == disk.strip():
+        print("  ✓ 一致 —— 磁盘内容与回放结果相同，压缩不会改变记忆")
         return 0
 
     # 不一致：给出可操作的诊断
