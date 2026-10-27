@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import signal
 import time
 import traceback
@@ -252,7 +253,65 @@ class Kernel:
         if slept > 0:
             self.events.append("delay", seconds=round(slept, 2), reason=why)
         self.events.append("turn/end", turn=turn, reason=why, slept_seconds=round(slept, 2))
+        self._run_housekeeping()
         self._write_state("running")
+
+    def _run_housekeeping(self) -> None:
+        """每轮结束时跑一次运维钩子（备份、记忆同步等）。
+
+        为什么放在内核里而不是 cron：
+        这台机器的 cron 对 fish 用户根本不执行任务（2026-10-27 实测：
+        systemctl 显示 active、crontab 有内容、进程也在，但加一个每分钟
+        写日志的探针等 90 秒，日志文件根本没被创建）。于是所有「每小时
+        自动备份」实际上从未发生。
+
+        也不放在 Agent 手里：那样等于依赖「我记得调用」，而我确实会忘。
+        所以交给内核——它每轮结束都会经过这里，比我可靠。
+
+        钩子本身很便宜：读一个时间戳文件，不到期就直接返回。
+        钩子失败绝不影响主循环：异常被吞掉并记日志。
+        """
+        hook = self.archive.root / "Work" / "periodic.sh"
+        if not hook.is_file():
+            return
+
+        # 前置过滤：备份还新鲜就不 fork。
+        #
+        # periodic.sh 自己也会判断，但每次要付约 40ms 的进程启动成本；
+        # 每轮都付太浪费，所以在这里先看一眼时间戳。
+        # 读不出来（文件缺失/格式坏）就当作过期，宁可多跑一次。
+        stamp = hook.parent / ".last_periodic"
+        try:
+            if stamp.is_file():
+                newest = max(
+                    (int(line.split("=", 1)[1])
+                     for line in stamp.read_text(encoding="utf-8").splitlines()
+                     if line.startswith(("backup=", "identity=")) and "=" in line
+                     and line.split("=", 1)[1].strip().isdigit()),
+                    default=0,
+                )
+                if newest and time.time() - newest < 55 * 60:
+                    return
+        except Exception:
+            pass                        # 时间戳读不出来就跑一次，宁可多跑
+
+        try:
+            result = subprocess.run(
+                ["bash", str(hook)],
+                capture_output=True, text=True, timeout=120,
+                cwd=str(hook.parent),
+            )
+            output = (result.stdout or "").strip()
+            if output:
+                # 只在真的干活时记一笔，避免每轮刷屏
+                self.logger.info(f"[housekeeping] {output.splitlines()[0]}")
+            if result.returncode != 0:
+                self.logger.warn(
+                    f"[housekeeping] periodic.sh 退出码 {result.returncode}："
+                    f"{(result.stderr or '').strip()[:200]}"
+                )
+        except Exception as exc:                     # noqa: BLE001 - 钩子绝不能拖垮主循环
+            self.logger.warn(f"[housekeeping] 执行失败（已忽略）：{exc}")
 
     def _call_model(
         self, messages: list[dict], tools: list[dict]
