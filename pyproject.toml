@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fishkernel"
-version = "0.3.0"
+dynamic = ["version"]
 description = "让大模型无限循环运行的内核"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,9 @@ dev = ["pytest>=7"]
 
 [project.scripts]
 fishkernel = "fishkernel.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "fishkernel.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
