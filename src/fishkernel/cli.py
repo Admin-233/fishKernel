@@ -64,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--height", type=int, default=None, help="固定高度（默认取终端）")
     p_tui.add_argument("--refresh", type=float, default=0.2, help="刷新间隔秒（默认 0.2）")
 
+    p_trim = sub.add_parser("trim", help="归档 events.jsonl 里已被压缩掉的老事件")
+    p_trim.add_argument("directory")
+    p_trim.add_argument("--dry-run", action="store_true", help="只展示计划，不写盘")
+    p_trim.add_argument("--yes", action="store_true", help="跳过确认")
+
     p_web = sub.add_parser("web", help="启动网页控制台（零依赖，只读写存档文件）")
     p_web.add_argument("directory")
     p_web.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1，仅本机）")
@@ -97,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_cost(args)
         if args.command == "web":
             return _cmd_web(args)
+        if args.command == "trim":
+            return _cmd_trim(args)
     except (ArchiveError, ConfigError, ValueError, FileNotFoundError, LockError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
@@ -147,6 +154,65 @@ def _cmd_cost(args) -> int:
     print()
     print(f"  估算花费      ¥{totals.cost_yuan:,.2f}")
     print(f"  （单价：命中 ¥{PRICE_CACHE_HIT}/M，未命中 ¥{PRICE_CACHE_MISS}/M，输出 ¥{PRICE_OUTPUT}/M）")
+    return 0
+
+
+def _cmd_trim(args) -> int:
+    """归档已被压缩的老事件。
+
+    安全原则：plan_trim() 会先验证「归档后上下文投影逐字节一致」，
+    不一致就抛 TrimError 拒绝执行。所以这个命令可以放心先 --dry-run。
+    """
+    from .trim import TrimError, apply_trim, list_archives, plan_trim, stats
+
+    archive = _open_archive(args.directory)
+    before = stats(archive)
+
+    print(f"存档：{archive.root}")
+    print(f"事件：{before['events']:,} 条 / {before['bytes']:,} 字节"
+          f"（seq {before['first_seq']}..{before['last_seq']}）")
+
+    try:
+        plan = plan_trim(archive)
+    except TrimError as exc:
+        print(f"\n拒绝归档：{exc}")
+        return 1
+
+    if plan.empty:
+        print("\n没有可归档的事件（压缩点之前已经是空的）。")
+        return 0
+
+    print("\n归档计划：")
+    print(f"  切分点        seq {plan.cutoff_seq}（最近一次 compression/summary 的 to_seq）")
+    print(f"  归档            {len(plan.archived):,} 条 / {plan.archived_bytes:,} 字节")
+    print(f"  保留            {len(plan.kept):,} 条")
+    print("  ✓ 已校验：归档后上下文投影逐字节一致")
+
+    if args.dry_run:
+        print("\n（--dry-run，未写盘）")
+        return 0
+
+    if not args.yes:
+        try:
+            answer = input("\n执行归档？归档文件会写到 Memory/，原事件保留在归档文件里。[y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("已取消。")
+            return 0
+
+    path = apply_trim(archive, plan)
+    if path is None:
+        print("没有需要归档的事件。")
+        return 0
+
+    after = stats(archive)
+    saved = before["bytes"] - after["bytes"]
+    pct = (saved / before["bytes"] * 100) if before["bytes"] else 0
+    print(f"\n已归档到 {path}")
+    print(f"events.jsonl：{before['bytes']:,} → {after['bytes']:,} 字节"
+          f"（省 {saved:,}，{pct:.1f}%）")
+    print(f"归档文件共 {len(list_archives(archive))} 份，都在 Memory/ 下，可随时回头查。")
     return 0
 
 
