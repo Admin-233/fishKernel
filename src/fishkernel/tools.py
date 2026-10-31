@@ -588,28 +588,25 @@ class ToolBox:
             raise _ToolError("invalid_arguments", "mode 只能是 append 或 replace")
         if not content.strip():
             raise _ToolError("invalid_arguments", "content 不能为空")
-        current = self.archive.read_text(self.archive.long_term_memory_path)
-        updated = content if mode == "replace" else (current.rstrip() + "\n\n" + content.strip() + "\n")
+        from .memory import MemoryStore, apply_write
+        from .events import read_events
+        store = MemoryStore(self.archive)
+        current = (store.recover(read_events(self.archive.events_path)).content if self.events is not None
+                   else self.archive.read_text(self.archive.long_term_memory_path))
+        updated = apply_write(current, mode, content)
         encoded = len(updated.encode("utf-8"))
         if encoded > MAX_MEMORY_BYTES:
             raise _ToolError(
                 "memory_too_large",
                 f"长期记忆会达到 {encoded} 字节，超过上限 {MAX_MEMORY_BYTES}；请先精简或替换整份内容",
             )
-        # KernelDesign 3.2：LongTermMemory.txt 只由内核在压缩事务里写。
-        # 这里不碰文件，只把"要记住的东西"登记进事件流；
-        # 未触发压缩时，这些内容靠上下文本身被模型看到。
         if self.events is None:
-            # 独立使用 ToolBox（无事件流）时退化成立即写盘
             self.archive.write_long_term_memory(updated)
-            return {"mode": mode, "bytes": encoded, "deferred": False}
-        self.events.append("memory/write", mode=mode, content=content, bytes=encoded)
-        return {
-            "mode": mode,
-            "bytes": encoded,
-            "deferred": True,
-            "note": "已登记，将在下次上下文压缩时写入 LongTermMemory.txt；在此之前它仍在上下文中可见。",
-        }
+        else:
+            self.events.append("memory/write", mode=mode, content=content, bytes=encoded)
+            store.recover(read_events(self.archive.events_path))
+        return {"mode": mode, "bytes": encoded, "deferred": False}
+
 
 
 class _ToolError(Exception):

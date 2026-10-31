@@ -30,7 +30,7 @@ from .tools import ToolBox
 
 # 这些错误说明存档或配置本身有问题，重试多少次都不会自愈。
 # 遇到就停下并返回非零，把问题暴露出来让人处理 —— 空转只会烧时间。
-FATAL_ERRORS: tuple[type[BaseException], ...] = (ArchiveError, ConfigError)
+FATAL_ERRORS: tuple[type[BaseException], ...] = (ArchiveError, ConfigError, OSError)
 
 
 def _is_fatal(exc: BaseException) -> bool:
@@ -75,7 +75,7 @@ class Kernel:
         self.archive.ensure_runtime()
         self.config: InstanceConfig = load_config(self.archive.root)
         self.logger = Logger(self.archive.log_path, echo=echo)
-        self.events = EventLog(self.archive.events_path).open()
+        self.events = EventLog(self.archive.events_path)
         self.control = Control(self.archive)
         self.jobs = JobManager(self.archive)
         self.lock = InstanceLock(self.archive.lock_path)
@@ -94,11 +94,20 @@ class Kernel:
 
     # ---- 生命周期 ----
     def run(self) -> int:
+        from .platform import require_runtime
+        require_runtime()
+        self.lock.acquire(timeout=5.0)
         try:
-            self.lock.acquire(timeout=5.0)
-        except LockError as exc:
-            self.logger.error(str(exc))
-            raise
+            self.events.open()
+            from .memory import MemoryStore
+            MemoryStore(self.archive).recover(read_events(self.archive.events_path))
+            return self._run_locked()
+        finally:
+            self.events.close()
+            self.lock.release()
+            self._restore_signals()
+
+    def _run_locked(self) -> int:
         self._install_signals()
         reason = "max_turns"
         exit_code = 0
@@ -226,10 +235,9 @@ class Kernel:
         self.events.append("turn/start", turn=turn)
         self.logger.info(f"—— 第 {turn} 轮 ——")
 
-        for text in self.control.poll_inbox():
-            self.events.append("user/message", text=text, source="control")
-            self.archive.append_history(f"用户：{text}")
-            self.logger.info(f"用户消息：{text}")
+        for item in self.control.commit_inbox(self.events):
+            self.archive.append_history(f"用户：{item['text']}")
+            self.logger.info("用户消息已提交")
 
         for job in self.jobs.tick():
             self._report_job(job)
@@ -280,78 +288,7 @@ class Kernel:
         if slept > 0:
             self.events.append("delay", seconds=round(slept, 2), reason=why)
         self.events.append("turn/end", turn=turn, reason=why, slept_seconds=round(slept, 2))
-        self._run_housekeeping()
         self._write_state("running")
-
-    def _run_housekeeping(self) -> None:
-        """每轮结束时跑一次运维钩子（备份、记忆同步等）。
-
-        为什么放在内核里而不是 cron：
-        这台机器的 cron 对 fish 用户根本不执行任务（2026-10-27 实测：
-        systemctl 显示 active、crontab 有内容、进程也在，但加一个每分钟
-        写日志的探针等 90 秒，日志文件根本没被创建）。于是所有「每小时
-        自动备份」实际上从未发生。
-
-        也不放在 Agent 手里：那样等于依赖「我记得调用」，而我确实会忘。
-        所以交给内核——它每轮结束都会经过这里，比我可靠。
-
-        钩子本身很便宜：读一个时间戳文件，不到期就直接返回。
-        钩子失败绝不影响主循环：异常被吞掉并记日志。
-        """
-        hook = self.archive.root / "Work" / "periodic.sh"
-        if not hook.is_file():
-            return
-
-        # 前置过滤：备份还新鲜就不 fork。
-        #
-        # periodic.sh 自己也会判断，但每次要付约 40ms 的进程启动成本；
-        # 每轮都付太浪费，所以在这里先看一眼时间戳。
-        # 读不出来（文件缺失/格式坏）就当作过期，宁可多跑一次。
-        stamp = hook.parent / ".last_periodic"
-        try:
-            if stamp.is_file():
-                newest = max(
-                    (int(line.split("=", 1)[1])
-                     for line in stamp.read_text(encoding="utf-8").splitlines()
-                     if line.startswith(("backup=", "identity=")) and "=" in line
-                     and line.split("=", 1)[1].strip().isdigit()),
-                    default=0,
-                )
-                if newest and time.time() - newest < 55 * 60:
-                    # 时间还没到 —— 但可能「备份落后于最新提交」。
-                    # 之前只按时间过滤，导致内容驱动的备份永远触发不了：
-                    # 刚提交完代码，备份时间是 1 分钟前（< 55 分钟），
-                    # 于是每轮都在这儿 return，periodic.sh 根本没机会跑。
-                    # 现在额外看一眼 check_fresh.sh 的结果。
-                    fresh = hook.parent / "check_fresh.sh"
-                    if not fresh.is_file():
-                        return
-                    probe = subprocess.run(
-                        ["bash", str(fresh)], capture_output=True, text=True,
-                        timeout=30, cwd=str(hook.parent),
-                    )
-                    if probe.returncode == 0:
-                        return          # 备份都是最新的，确实不用跑
-        except Exception:
-            pass                        # 时间戳读不出来就跑一次，宁可多跑
-
-        try:
-            result = subprocess.run(
-                ["bash", str(hook)],
-                capture_output=True, text=True, timeout=120,
-                cwd=str(hook.parent),
-            )
-            output = (result.stdout or "").strip()
-            if output:
-                # 只在真的干活时记一笔，避免每轮刷屏
-                self.logger.info(f"[housekeeping] {output.splitlines()[0]}")
-            if result.returncode != 0:
-                self.logger.warn(
-                    f"[housekeeping] periodic.sh 退出码 {result.returncode}："
-                    f"{(result.stderr or '').strip()[:200]}"
-                )
-        except Exception as exc:                     # noqa: BLE001 - 钩子绝不能拖垮主循环
-            self.logger.warn(f"[housekeeping] 执行失败（已忽略）：{exc}")
 
     def _call_model(
         self, messages: list[dict], tools: list[dict]

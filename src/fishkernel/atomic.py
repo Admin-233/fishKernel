@@ -19,6 +19,7 @@ def write_atomic(path: Path | str, text: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        sync_directory(path.parent)
     finally:
         if tmp.exists():
             try:
@@ -35,3 +36,14 @@ def append_line(path: Path | str, line: str) -> None:
         handle.write(line.rstrip("\n") + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def sync_directory(path: Path) -> None:
+    """Persist a rename/directory entry on systems supporting directory fsync."""
+    if os.name != "posix":
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

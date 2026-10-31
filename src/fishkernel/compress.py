@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from .archive import Archive, render_history
+from .archive import Archive, ArchiveError, render_history
 from .config import InstanceConfig
 from .constants import SUMMARY_MAX_TOKENS_CAP
 from .events import Event, EventLog, read_events
@@ -103,6 +103,12 @@ class Compressor:
     def recover_stale(self) -> bool:
         """未闭合的 compaction/start 视为上次崩溃残留，补一条 abort。"""
         events = read_events(self.archive.events_path)
+        committed = [e for e in events if e.type == "compaction/summary"
+                     and e.data.get("projection_version") == 1]
+        if committed:
+            summary = str(committed[-1].data["summary"])
+            if self.archive.read_text(self.archive.digest_path) != summary:
+                self.archive.write_digest(summary)
         last_start = -1
         for index, event in enumerate(events):
             if event.type == "compaction/start":
@@ -111,7 +117,9 @@ class Compressor:
                 last_start = -1
         if last_start < 0:
             return False
-        self.events.append("compaction/abort", reason="stale：上次压缩未完成", recovered=True)
+        committed_here = any(e.type == "compaction/summary" for e in events[last_start + 1:])
+        self.events.append("compaction/end" if committed_here else "compaction/abort",
+                           ok=committed_here, reason="recovered", recovered=True)
         self._log("发现未闭合的压缩事务，已标记为 stale")
         return True
 
@@ -174,7 +182,9 @@ class Compressor:
                 region_tokens=region_tokens,
                 kept_tokens=kept_tokens,
             )
-        except Exception as exc:  # noqa: BLE001 - 压缩失败不能杀死内核
+        except (ArchiveError, OSError):
+            raise
+        except Exception as exc:  # Model failures leave the previous committed summary intact.
             self.events.append("compaction/abort", reason=f"{type(exc).__name__}: {exc}"[:500])
             self._log(f"压缩失败：{exc}")
             return CompactionOutcome(compacted=False, reason="error")
@@ -255,87 +265,9 @@ class Compressor:
         return best if best and estimate_text(best) < region_tokens else None, usage
 
     def _flush_pending_memory(self, region_events: list[Event]) -> int:
-        """把被压缩区里的 memory/write 事件真正写入 LongTermMemory.txt。
-
-        设计（KernelDesign 3.2）：长期记忆只在压缩事务里落盘。
-        未压缩前，这些内容还活在上下文中，不需要抢占磁盘；
-        一旦它们即将被压缩掉，就必须落盘，否则会丢失。
-        """
-        pending = [event for event in region_events if event.type == "memory/write"]
-        if not pending:
-            return 0
-
-        # 语义：按事件顺序重放 memory 操作，replace 清空已有内容（含前面的 append），
-        # 但**不影响它之后的 append**。
-        #
-        # 历史 bug：这里写过 `if mode == "replace": replace_text = content; appended = []`。
-        # appended 被清空之后，后续 append 仍追加到同一个列表里，最后却因为
-        # `if replace_text is not None` 分支只写 replace_text 而被整个丢弃——
-        # 即「replace 之后的 append 全部静默丢失」，函数却照样返回处理条数。
-        # 这正是 Agent 自身的常见用法（先 replace 重写长期记忆，再 append 追加），
-        # 一旦触发压缩就会真的丢记忆。
-        parts: list[str] = []
-        for event in pending:
-            mode = str(event.data.get("mode") or "append")
-            content = str(event.data.get("content") or "").strip()
-            if not content:
-                continue
-            if mode == "replace":
-                parts = [content]               # 覆盖此前的全部内容
-            else:
-                parts.append(content)
-        if not parts:
-            return 0
-        replaced = any(
-            str(event.data.get("mode") or "append") == "replace"
-            and str(event.data.get("content") or "").strip()
-            for event in pending
-        )
-
-        current = self.archive.read_text(self.archive.long_term_memory_path)
-
-        # 关键检查：压缩区之外是否还有更新的 memory/write？
-        #
-        # 事故背景：压缩只处理「压缩区内」的事件。如果之后（在保留区里）用户又用
-        # memory 工具改过记忆，那些内容不会进 pending，却已经是更新的事实。
-        # 此时若按 pending 里的旧 replace 覆盖磁盘，就会把更新的记忆打回旧版。
-        #
-        # 我实际踩到过：磁盘上是手写整理的 3686 字符完整记忆，压缩区内只有
-        # seq 48 / 498 两个旧 replace（合计 1620 字符），压缩后磁盘被覆盖成旧版。
-        #
-        # 判断方式：看事件流里最后一个 memory/write 的 seq 是否大于本批最大的 seq。
-        newer_exists = self._has_newer_memory_write(region_events)
-        if newer_exists:
-            # 更新的记忆还在保留区里，磁盘内容才是最新的：本批一个字都不写。
-            self._log(
-                "压缩区外还有更新的 memory/write，跳过落盘以避免回退（磁盘内容已是最新）"
-            )
-            return 0
-
-        extra = "\n\n".join(parts)
-        if replaced:
-            # 有 replace：以它为准，不保留磁盘上的旧内容
-            updated = extra + "\n"
-        else:
-            base = current.rstrip()
-            updated = (base + "\n\n" + extra + "\n") if base else (extra + "\n")
-        self.archive.write_long_term_memory(updated)
-        return len(pending)
-
-    def _has_newer_memory_write(self, region_events: list[Event]) -> bool:
-        """压缩区之外是否还存在比本批更新的 memory/write 事件。"""
-        if not region_events:
-            return False
-        last_region_seq = max(event.seq for event in region_events
-                              if event.type == "memory/write")
-        try:
-            events = read_events(self.archive.events_path)
-        except Exception:
-            return False
-        for event in events:
-            if event.type == "memory/write" and event.seq > last_region_seq:
-                return True
-        return False
+        from .memory import MemoryStore
+        MemoryStore(self.archive).recover(read_events(self.archive.events_path))
+        return sum(event.type == "memory/write" for event in region_events)
 
     def _commit(
         self,
@@ -348,7 +280,8 @@ class Compressor:
         region_tokens: int,
         kept_tokens: int,
     ) -> CompactionOutcome:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        import uuid
+        stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
         archived_path = self.archive.archive_record_path(stamp)
         header = (
             f"# 压缩存档 {stamp}\n"
@@ -361,11 +294,11 @@ class Compressor:
         flushed = self._flush_pending_memory(region_events)
         if flushed:
             self._log(f"把 {flushed} 条待写记忆落盘到 LongTermMemory.txt")
-        self.archive.write_digest(summary)
         summary_tokens = estimate_text(summary)
         freed = max(0, region_tokens - summary_tokens)
         self.events.append(
             "compaction/summary",
+            projection_version=1,
             summary=summary,
             from_seq=from_seq,
             to_seq=to_seq,
@@ -376,6 +309,7 @@ class Compressor:
             retained_tokens=kept_tokens,
             usage=usage,
         )
+        self.archive.write_digest(summary)
         self.events.append("compaction/end", ok=True)
         self.archive.rewrite_history(read_events(self.archive.events_path))
         self._log(f"压缩完成：seq {from_seq}..{to_seq} → 概要，释放约 {freed} tokens")

@@ -8,9 +8,14 @@ from __future__ import annotations
 
 import json
 import time
+import math
+import hashlib
+import uuid
 
 from .archive import Archive
-from .atomic import write_atomic
+from .atomic import write_atomic, append_line
+from .lock import InstanceLock
+from .events import read_events
 
 VALID_RUN_STATES = {"run", "pause", "stop"}
 
@@ -38,7 +43,7 @@ class Control:
         run = raw.get("run")
         run = run if run in VALID_RUN_STATES else "run"
         delay = raw.get("delay")
-        if not isinstance(delay, (int, float)) or delay < 0:
+        if not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 0:
             delay = None
         return {"run": run, "delay": float(delay) if delay is not None else None}
 
@@ -54,13 +59,17 @@ class Control:
         return False
 
     def write_state(self, *, run: str | None = None, delay: float | None = None) -> dict[str, object]:
+        with InstanceLock(self.archive.control_dir / "state.lock"):
+            return self._write_state(run=run, delay=delay)
+
+    def _write_state(self, *, run=None, delay=None):
         state = self.read_state()
         if run is not None:
             if run not in VALID_RUN_STATES:
                 raise ValueError(f"无效的运行状态：{run}")
             state["run"] = run
         if delay is not None:
-            if delay < 0:
+            if not math.isfinite(delay) or delay < 0:
                 raise ValueError("延时不能为负")
             state["delay"] = float(delay)
         payload = {"run": state["run"], "delay": state["delay"], "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
@@ -77,43 +86,81 @@ class Control:
     def set_inbox_offset(self, offset: int) -> None:
         write_atomic(self.archive.inbox_offset_path, str(max(0, offset)))
 
-    def poll_inbox(self) -> list[str]:
-        """增量读取 inbox，返回新消息；只消费完整行。"""
-        path = self.archive.inbox_path
-        if not path.exists():
-            return []
+    def peek_inbox(self) -> tuple[list[dict], int]:
+        """Read complete records without acknowledging them."""
         offset = self.inbox_offset()
         try:
-            size = path.stat().st_size
-        except OSError:
-            return []
-        if size <= offset:
-            return []
-        with open(path, "rb") as handle:
-            handle.seek(offset)
-            chunk = handle.read(size - offset)
-        consumed = offset
-        texts: list[str] = []
-        for raw_line in chunk.splitlines(keepends=True):
-            if not raw_line.endswith(b"\n"):
-                break  # 半行，留到下次
-            consumed += len(raw_line)
-            try:
-                payload = json.loads(raw_line.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                continue
-            if isinstance(payload, dict) and isinstance(payload.get("text"), str) and payload["text"].strip():
-                texts.append(payload["text"])
-        if consumed != offset:
-            self.set_inbox_offset(consumed)
-        return texts
+            with self.archive.inbox_path.open("rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read(16 * 1024 * 1024)
+        except FileNotFoundError:
+            return [], offset
+        items = []
+        for line in chunk.splitlines(keepends=True):
+            if not line.endswith(b"\n"):
+                break
+            raw = json.loads(line)
+            if not isinstance(raw, dict) or not isinstance(raw.get("text"), str):
+                raise ValueError("Malformed complete inbox record")
+            raw.setdefault("id", "legacy-" + hashlib.sha256(str(offset).encode() + line).hexdigest())
+            raw.setdefault("source", "control")
+            if not isinstance(raw["id"], str) or not raw["id"]:
+                raise ValueError("Invalid input ID")
+            items.append(raw)
+            offset += len(line)
+        return items, offset
 
-    def push_message(self, text: str) -> None:
-        path = self.archive.inbox_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "text": text}, ensure_ascii=False)
-        with open(path, "a", encoding="utf-8", newline="") as handle:
-            handle.write(line + "\n")
+    def poll_inbox(self) -> list[str]:
+        """Compatibility read API; acknowledgement requires commit_inbox()."""
+        return [item["text"] for item in self.peek_inbox()[0]]
+
+    def commit_inbox(self, events) -> list[dict]:
+        items, end = self.peek_inbox()
+        if not items:
+            return []
+        receipts_path = self.archive.control_dir / "input-receipts.json"
+        try:
+            receipts = json.loads(receipts_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            receipts = {}
+        if not isinstance(receipts, dict):
+            raise ValueError("Malformed input receipts")
+        # The log closes the crash window between event commit and receipt commit.
+        for event in read_events(self.archive.events_path):
+            if event.type == "user/message" and event.data.get("input_id"):
+                receipts[event.data["input_id"]] = event.seq
+        added = []
+        for item in items:
+            if item["id"] in receipts:
+                continue
+            event = events.append("user/message", text=item["text"], source=item["source"],
+                                  input_id=item["id"], metadata=item.get("metadata", {}))
+            receipts[item["id"]] = event.seq
+            added.append(item)
+        write_atomic(receipts_path, json.dumps(receipts, ensure_ascii=False))
+        self.set_inbox_offset(end)
+        return added
+
+    def push_message(self, text: str, *, source: str = "control", external_id: str | None = None,
+                     metadata: dict | None = None) -> str:
+        if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 256 * 1024:
+            raise ValueError("Input must contain 1..262144 UTF-8 bytes")
+        identity = (hashlib.sha256(json.dumps([source, external_id]).encode()).hexdigest()
+                    if external_id is not None else uuid.uuid4().hex)
+        payload = {"id": identity, "source": source, "metadata": metadata or {},
+                   "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "text": text}
+        line = json.dumps(payload, ensure_ascii=False)
+        if len(line.encode("utf-8")) > 512 * 1024:
+            raise ValueError("Input envelope too large")
+        with InstanceLock(self.archive.control_dir / "inbox.lock"):
+            size = self.archive.inbox_path.stat().st_size if self.archive.inbox_path.exists() else 0
+            if size - self.inbox_offset() + len(line.encode("utf-8")) > 16 * 1024 * 1024:
+                raise ValueError("Inbox full; retry later")
+            append_line(self.archive.inbox_path, line)
+        return identity
+
+    def has_pending(self) -> bool:
+        return bool(self.peek_inbox()[0])
 
     # ---- 唤醒 / 重启请求 ----
     def request_wake(self) -> None:
@@ -121,6 +168,8 @@ class Control:
 
     def consume_wake(self) -> bool:
         """存在唤醒请求就消费掉（只生效一次）。"""
+        if self.has_pending():
+            return True
         try:
             self.archive.wake_path.unlink()
         except FileNotFoundError:
@@ -159,6 +208,8 @@ class Control:
 
         返回 (实际睡了多久, 原因)，原因 ∈ {"elapsed", "pause", "stop", "wake"}。
         """
+        if not math.isfinite(seconds):
+            raise ValueError("Sleep must be finite")
         if seconds <= 0:
             state = self.read_state()
             if state["run"] == "stop":

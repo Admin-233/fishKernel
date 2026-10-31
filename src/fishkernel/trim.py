@@ -90,10 +90,14 @@ def plan_trim(archive: Archive, events: list[Event] | None = None) -> TrimPlan:
     if not isinstance(to_seq, int):
         raise TrimError("最近的 compaction/summary 缺少合法的 to_seq，拒绝归档")
 
-    # summary 之后不能再有未闭合的压缩事务
-    for event in events[summary_index + 1 :]:
+    pending = False
+    for event in events[summary_index + 1:]:
         if event.type == "compaction/start":
-            raise TrimError("存在未闭合的压缩事务（compaction/start 没有配对），拒绝归档")
+            pending = True
+        elif event.type in {"compaction/end", "compaction/abort"}:
+            pending = False
+    if pending:
+        raise TrimError("存在未闭合的压缩事务，拒绝归档")
 
     # 切分点：to_seq 及之前全部归档，但必须保留 summary 事件本身
     archived = [event for event in events if event.seq <= to_seq and event is not summary_event]
@@ -135,7 +139,21 @@ def _ensure_no_kernel_running(archive: Archive) -> None:
 
 def apply_trim(archive: Archive, plan: TrimPlan, *, stamp: str | None = None) -> Path | None:
     """执行归档：先把要挪走的事件写成归档文件，再原子替换 events.jsonl。"""
-    _ensure_no_kernel_running(archive)
+    lock = InstanceLock(archive.lock_path)
+    try:
+        lock.acquire()
+    except LockError as exc:
+        raise TrimError("内核正在运行，不能 trim") from exc
+    try:
+        current = plan_trim(archive)
+        if [e.to_json() for e in current.archived + current.kept] != [e.to_json() for e in plan.archived + plan.kept]:
+            raise TrimError("日志已经变化，请重新生成归档计划")
+        return _apply_locked(archive, current, stamp=stamp)
+    finally:
+        lock.release()
+
+
+def _apply_locked(archive: Archive, plan: TrimPlan, *, stamp: str | None = None) -> Path | None:
     if plan.empty:
         return None
 

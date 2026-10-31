@@ -29,10 +29,11 @@ class Event:
     ts: str
     type: str
     data: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(
-            {"seq": self.seq, "ts": self.ts, "type": self.type, "data": self.data},
+            {**self.extra, "seq": self.seq, "ts": self.ts, "type": self.type, "data": self.data},
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -50,7 +51,9 @@ class Event:
         if not isinstance(seq, int) or not isinstance(etype, str):
             return None
         data = raw.get("data")
-        return cls(seq=seq, ts=str(raw.get("ts", "")), type=etype, data=data if isinstance(data, dict) else {})
+        return cls(seq=seq, ts=str(raw.get("ts", "")), type=etype,
+                   data=data if isinstance(data, dict) else {},
+                   extra={k: v for k, v in raw.items() if k not in {"seq", "ts", "type", "data"}})
 
 
 def truncate_partial_tail(path: Path) -> bool:
@@ -114,9 +117,14 @@ class EventLog:
     def append(self, event_type: str, **data: Any) -> Event:
         if not self._opened:
             raise RuntimeError("EventLog 未打开")
-        self._seq += 1
-        event = Event(seq=self._seq, ts=now_iso(), type=event_type, data=data)
-        append_line(self.path, event.to_json())
+        event = Event(seq=self._seq + 1, ts=now_iso(), type=event_type, data=data)
+        try:
+            append_line(self.path, event.to_json())
+        except OSError:
+            # Completion may be uncertain after a failed fsync. Never reuse seq.
+            self._opened = False
+            raise
+        self._seq = event.seq
         return event
 
 
@@ -191,7 +199,7 @@ def read_events(path: Path | str, after_seq: int = 0) -> list[Event]:
         stat = path.stat()
     except OSError:
         return []
-    size, ino, mtime = stat.st_size, stat.st_ino, stat.st_mtime
+    size, ino, mtime = stat.st_size, stat.st_ino, stat.st_mtime_ns
 
     cached = _PARSE_CACHE.get(key)
     if cached is None:
@@ -208,22 +216,25 @@ def read_events(path: Path | str, after_seq: int = 0) -> list[Event]:
 
     if size > offset:
         new_events = list(cached_events)
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        with open(path, "rb") as handle:
             if offset:
                 handle.seek(offset)
-            for line in handle:
-                line = line.strip()
+            new_offset = offset
+            for raw in handle:
+                if not raw.endswith(b"\n"):
+                    break
+                new_offset += len(raw)
+                line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
                 event = Event.from_json(line)
                 if event is None:
                     continue
                 new_events.append(event)
-            new_offset = handle.tell()
         # 用解析到的新位置 + 当时的 mtime 作为下次的基线
         try:
             after = path.stat()
-            ino, mtime = after.st_ino, after.st_mtime
+            ino, mtime = after.st_ino, after.st_mtime_ns
         except OSError:
             pass
         _PARSE_CACHE[key] = (new_offset, ino, mtime, new_events)

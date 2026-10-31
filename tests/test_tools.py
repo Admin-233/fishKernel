@@ -137,12 +137,8 @@ def test_read_file_spills_remainder(archive):
 
 
 # ---- 长期记忆的延迟落盘语义 ----
-def test_memory_is_deferred_until_compaction(archive):
-    """memory 工具只登记事件，不立刻写 LongTermMemory.txt。
-
-    KernelDesign 3.2：该文件只由内核在压缩事务里写。
-    未触发压缩时，内容靠上下文本身被模型看到。
-    """
+def test_memory_is_committed_before_tool_success(archive):
+    """Successful memory calls have a recoverable projection before compression."""
     import json
 
     from fishkernel.control import Control
@@ -155,9 +151,9 @@ def test_memory_is_deferred_until_compaction(archive):
     result = box.dispatch("memory", json.dumps({"mode": "append", "content": "记住这件事"}))
     payload = json.loads(result.text)
 
-    assert payload["deferred"] is True
-    # 文件此时必须还是空的
-    assert archive.read_text(archive.long_term_memory_path).strip() == ""
+    assert payload["deferred"] is False
+    # The projection is already current.
+    assert archive.read_text(archive.long_term_memory_path).strip() == "记住这件事"
     # 但事件流里已经登记
     writes = [e for e in read_events(archive.events_path) if e.type == "memory/write"]
     assert len(writes) == 1

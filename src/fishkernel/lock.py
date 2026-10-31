@@ -6,9 +6,9 @@ POSIX 用 flock，Windows 用 msvcrt.locking。两者都由操作系统在进程
 
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
+from .platform import lock_file, require_runtime
 
 
 class LockError(Exception):
@@ -25,6 +25,9 @@ class InstanceLock:
         return self._handle is not None
 
     def acquire(self, *, timeout: float = 0.0, poll: float = 0.1) -> None:
+        require_runtime()
+        if self.held:
+            raise LockError("lock is already held by this object")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = open(self.path, "a+b")
         deadline = time.monotonic() + max(0.0, timeout)
@@ -60,23 +63,7 @@ class InstanceLock:
 
     # ---- 平台差异 ----
     def _lock(self, handle) -> None:
-        if os.name == "windows":
-            import msvcrt
-
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file(handle)
 
     def _unlock(self, handle) -> None:
-        if os.name == "windows":
-            import msvcrt
-
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        lock_file(handle, unlock=True)

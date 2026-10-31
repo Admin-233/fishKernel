@@ -42,11 +42,12 @@ def test_interruptible_sleep_pause_and_stop(archive):
     assert slept >= 0.03
 
 
-def test_inbox_incremental(archive):
+def test_inbox_incremental(archive, log):
     control = Control(archive)
     control.push_message("第一条")
     control.push_message("第二条")
     assert control.poll_inbox() == ["第一条", "第二条"]
+    control.commit_inbox(log)
     assert control.poll_inbox() == []
     control.push_message("第三条")
     assert control.poll_inbox() == ["第三条"]
