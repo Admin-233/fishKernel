@@ -8,7 +8,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .config import InstanceConfig
+from .config import InstanceConfig, ConfigError, validate_options, validate_thinking
+from copy import deepcopy
 from .constants import LLM_RETRIES, LLM_TIMEOUT_SECONDS, RETRY_BACKOFF_SECONDS
 
 _CONTEXT_OVERFLOW_PATTERN = re.compile(
@@ -95,17 +96,34 @@ class OpenAIClient:
         import openai
 
         client = self._ensure_client()
+        options = validate_options(self.config.options)
+        validate_thinking(self.config)
         payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": int(max_tokens or self.config.max_tokens),
-            "temperature": self.config.temperature if temperature is None else temperature,
+            "model": self.model, "messages": messages,
+            options.get("output_parameter", "max_tokens"): int(max_tokens or self.config.max_tokens),
         }
+        if options.get("send_temperature", True):
+            payload["temperature"] = self.config.temperature if temperature is None else temperature
         if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            if not options.get("tools", True):
+                raise ConfigError("This configuration disables required tool support")
+            payload.update(tools=tools, tool_choice="auto")
+        if not options.get("vision", True) and any(isinstance(m.get("content"), list) for m in messages):
+            raise ConfigError("This configuration disables vision; select a text continuation")
         if self.config.effort:
             payload["reasoning_effort"] = self.config.effort
+        extra = deepcopy(options.get("extra_body", {}))
+        mode = options.get("thinking_modes", {}).get(self.config.thinking, {})
+        if "reasoning_effort" in mode:
+            if self.config.effort and self.config.effort != mode["reasoning_effort"]:
+                raise ConfigError("effort conflicts with the selected thinking mapping")
+            payload["reasoning_effort"] = mode["reasoning_effort"]
+        for key, value in mode.get("extra_body", {}).items():
+            if key in extra and extra[key] != value:
+                raise ConfigError(f"Conflicting thinking parameter: {key}")
+            extra[key] = value
+        if extra:
+            payload["extra_body"] = extra
 
         last_error: Exception | None = None
         for attempt in range(LLM_RETRIES):

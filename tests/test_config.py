@@ -44,9 +44,11 @@ def test_config_defaults_and_budget():
     assert config.budget.retain == math.floor(COMPACT_RETAIN_RATIO * (w - o))
 
 
-def test_config_rejects_unknown_model():
-    with pytest.raises(ConfigError):
-        config_from_values({"model": "gpt-4"})
+def test_config_accepts_arbitrary_model():
+    config = config_from_values({"model": "provider/model:custom"})
+    assert config.model == "provider/model:custom"
+    assert config.spec.context_window == 16384
+    assert config.budget.threshold > config.budget.retain > 0
 
 
 def test_config_rejects_bad_number():
@@ -73,6 +75,5 @@ def test_load_config_roundtrip(archive):
 
 
 def test_effort_validation():
-    with pytest.raises(ConfigError):
-        config_from_values({"effort": "ultra"})
+    assert config_from_values({"effort": "ultra"}).effort == "ultra"
     assert config_from_values({"effort": "max"}).effort == "max"

@@ -183,15 +183,17 @@ class Archive:
 
     def system_text(self) -> str:
         parts = [self.read_text(self.agent_path).strip()]
-        docs = self.tool_docs()
-        if docs:
-            parts.append("# 工具说明\n\n" + docs)
+        parts.append("# 当前扩展接口\n仅当前请求的工具 schema 代表已启用能力。旧 Tools/Work 文件保留供参考，不再自动加载或执行；新扩展请使用插件接口。")
         long_term = self.read_text(self.long_term_memory_path).strip()
         if long_term:
             parts.append("# 长期记忆\n\n" + long_term)
-        digest = self.read_text(self.digest_path).strip()
-        if digest:
-            parts.append("# 历史概要（上一次压缩）\n\n" + digest)
+        # A persisted summary is projected from its event exactly once. Legacy
+        # archives without summary events still retain their standalone Digest.
+        from .events import read_events
+        if not any(e.type == "compaction/summary" for e in read_events(self.events_path)):
+            digest = self.read_text(self.digest_path).strip()
+            if digest:
+                parts.append("# 历史概要\n\n" + digest)
         return "\n\n".join(part for part in parts if part)
 
     # ---- 写 ----

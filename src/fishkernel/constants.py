@@ -72,10 +72,10 @@ MODEL_SPECS: dict[str, ModelSpec] = {
 
 
 def model_spec(model_id: str) -> ModelSpec:
-    try:
-        return MODEL_SPECS[model_id]
-    except KeyError:
-        raise ValueError(f"未知模型 {model_id!r}；可选：{', '.join(sorted(MODEL_SPECS))}") from None
+    if not model_id or not model_id.strip():
+        raise ValueError("model must not be empty")
+    return MODEL_SPECS.get(model_id, ModelSpec(model_id, model_id, 16_384, 8_192, (), ""))
+
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,7 @@ def compaction_budget(spec: ModelSpec, max_tokens: int) -> CompactionBudget:
     """阈值 = floor(min(W*r, W-O-B))；保留 = floor(r_retain*(W-O))。"""
     w = spec.context_window
     o = max(0, min(int(max_tokens), spec.max_output_tokens))
-    threshold = math.floor(min(w * COMPACT_THRESHOLD_RATIO, w - o - COMPACT_HEADROOM_TOKENS))
+    threshold = math.floor(min(w * COMPACT_THRESHOLD_RATIO, w - o - min(COMPACT_HEADROOM_TOKENS, max(256, w // 16))))
     threshold = max(threshold, 1)
     retain = math.floor(COMPACT_RETAIN_RATIO * (w - o))
     retain = max(0, min(retain, threshold - 1))

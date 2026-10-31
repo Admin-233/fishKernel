@@ -10,7 +10,7 @@ from .config import InstanceConfig
 from .constants import SUMMARY_MAX_TOKENS_CAP
 from .events import Event, EventLog, read_events
 from .llm import LLMClient
-from .messages import conversation_units, project_units
+from .messages import conversation_units, project_units, message_units
 from .tokens import estimate_message, estimate_messages, estimate_text, estimate_tools
 
 SUMMARY_SYSTEM = """你是上下文压缩器。你的唯一任务是把给定的对话历史压缩成一份结构化的中文概要，
@@ -38,13 +38,13 @@ def _split_by_tokens(messages: list[dict], limit: int) -> list[list[dict]]:
     chunks: list[list[dict]] = []
     current: list[dict] = []
     total = 0
-    for message in messages:
-        cost = estimate_message(message)
+    for unit in message_units(messages):
+        cost = sum(estimate_message(message) for message in unit)
         if current and total + cost > limit:
             chunks.append(current)
             current = []
             total = 0
-        current.append(message)
+        current.extend(unit)
         total += cost
     if current:
         chunks.append(current)

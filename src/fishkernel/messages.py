@@ -80,7 +80,7 @@ def _unknown_outcome(call: dict[str, Any]) -> str:
     )
 
 
-def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]]:
+def build_messages(events: list[Event], system_text: str, *, reasoning_field: str | None = None, require_reasoning: bool = False) -> list[dict[str, Any]]:
     """把事件投影成 OpenAI chat messages。
 
     - 第 0 条固定是 system。
@@ -122,17 +122,29 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
                 index += 1
                 continue
             message: dict[str, Any] = {"role": "assistant", "content": text}
+            if reasoning_field:
+                reasoning = event.data.get("reasoning") or ""
+                complete = event.data.get("reasoning_complete", len(reasoning) != 4000)
+                if require_reasoning and calls and (not reasoning or not complete):
+                    raise ProjectionError("Historical reasoning is missing/truncated; configure a compatible continuation")
+                if reasoning:
+                    message[reasoning_field] = reasoning
             if calls:
                 message["tool_calls"] = calls
                 tail.append(message)
                 results: dict[str, Event] = {}
                 cursor = index + 1
-                while cursor < len(body) and body[cursor].type == "tool/result":
+                deferred = []
+                while cursor < len(body) and body[cursor].type != "assistant/message":
                     result_event = body[cursor]
-                    call_id = str(result_event.data.get("call_id", ""))
-                    if call_id:
-                        results[call_id] = result_event
+                    if result_event.type == "tool/result":
+                        call_id = str(result_event.data.get("call_id", ""))
+                        if call_id and call_id not in results:
+                            results[call_id] = result_event
+                    elif result_event.type in {"user/message", "system/message", "memory/write"}:
+                        deferred.append(result_event)
                     cursor += 1
+                image_messages = []
                 for call in calls:
                     result_event = results.get(call["id"])
                     if result_event is None:
@@ -180,7 +192,7 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
                                     {"type": "image_url", "image_url": {"url": url}}
                                 )
                             if len(blocks) > 1:
-                                tail.append({"role": "user", "content": blocks})
+                                image_messages.append({"role": "user", "content": blocks})
                         else:
                             tail.append(
                                 {
@@ -189,6 +201,8 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
                                     "content": output,
                                 }
                             )
+                tail.extend(image_messages)
+                tail.extend(build_messages(deferred, "")[1:])
                 index = cursor
                 continue
             tail.append(message)
@@ -211,7 +225,7 @@ def build_messages(events: list[Event], system_text: str) -> list[dict[str, Any]
             tail.append(
                 {
                     "role": "user",
-                    "content": f"{RUNTIME_PREFIX}长期记忆已登记（{mode}，压缩时落盘）：{content}",
+                    "content": f"{RUNTIME_PREFIX}长期记忆操作（{mode}）：{content}",
                 }
             )
         index += 1
@@ -262,9 +276,15 @@ def conversation_units(events: list[Event]) -> list[list[Event]]:
         elif event.type == "assistant/message":
             unit = [event]
             cursor = index + 1
-            while cursor < len(body) and body[cursor].type == "tool/result":
-                unit.append(body[cursor])
-                cursor += 1
+            ids = {call["id"] for call in _tool_calls(event.data)}
+            end = cursor
+            scan = cursor
+            while scan < len(body) and body[scan].type != "assistant/message":
+                if body[scan].type == "tool/result" and body[scan].data.get("call_id") in ids:
+                    end = scan + 1
+                scan += 1
+            unit.extend(body[cursor:end])
+            cursor = end
             units.append(unit)
             index = cursor
         else:
@@ -276,3 +296,24 @@ def project_units(units: list[list[Event]]) -> list[dict[str, Any]]:
     """把若干单元投影成消息（不含 system），供摘要调用使用。"""
     events = [event for unit in units for event in unit]
     return [message for message in build_messages(events, "") if message["role"] != "system"]
+
+
+def message_units(messages: list[dict]) -> list[list[dict]]:
+    """Never split an assistant call and its complete results for summarization."""
+    units = []
+    index = 0
+    while index < len(messages):
+        unit = [messages[index]]
+        pending = {c["id"] for c in messages[index].get("tool_calls", [])}
+        index += 1
+        while pending and index < len(messages):
+            message = messages[index]
+            if message.get("role") != "tool" or message.get("tool_call_id") not in pending:
+                raise ProjectionError("Tool results must immediately follow their assistant call")
+            unit.append(message)
+            pending.remove(message["tool_call_id"])
+            index += 1
+        if pending:
+            raise ProjectionError("Missing tool results")
+        units.append(unit)
+    return units

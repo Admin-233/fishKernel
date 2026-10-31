@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+import json
+import math
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .constants import (
@@ -38,9 +41,16 @@ class InstanceConfig:
     effort: str | None = None
     extra: dict[str, str] = field(default_factory=dict)
 
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    thinking: str = "auto"
+    options: dict = field(default_factory=dict)
+
     @property
     def spec(self) -> ModelSpec:
-        return model_spec(self.model)
+        original = model_spec(self.model)
+        return replace(original, context_window=self.context_window or original.context_window,
+                       max_output_tokens=self.max_output_tokens or original.max_output_tokens)
 
     @property
     def budget(self) -> CompactionBudget:
@@ -76,6 +86,9 @@ def parse_instance(text: str) -> dict[str, str]:
         key, _, value = line.partition("=")
         key = key.strip().lower()
         value = value.strip()
+        # Comments begin after whitespace outside quoted/JSON values; URL fragments survive.
+        if not value.startswith(('"', "'", "{", "[")):
+            value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         if not key:
@@ -92,14 +105,24 @@ def load_config(archive_root: Path) -> InstanceConfig:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"读取 {path} 失败：{exc}") from exc
-    return config_from_values(parse_instance(text), source=str(path))
+    values = parse_instance(text)
+    config = config_from_values(values, source=str(path))
+    options_path = Path(archive_root) / "model-options.json"
+    if options_path.exists():
+        try:
+            options = json.loads(options_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ConfigError(f"Invalid model-options.json: {exc}") from exc
+        config.options = validate_options(options)
+    validate_thinking(config)
+    return config
 
 
 def config_from_values(values: dict[str, str], *, source: str = "basic.instance") -> InstanceConfig:
-    known = {"name", "model", "api_base", "api_key", "max_tokens", "turn_delay", "temperature", "effort"}
+    known = {"name", "model", "api_base", "api_key", "max_tokens", "turn_delay", "temperature", "effort", "reasoning_effort", "context_window", "max_output_tokens", "thinking"}
     extra = {k: v for k, v in values.items() if k not in known}
 
-    model = values.get("model", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    model = values.get("model", DEFAULT_MODEL).strip()
     try:
         spec = model_spec(model)
     except ValueError as exc:
@@ -119,10 +142,18 @@ def config_from_values(values: dict[str, str], *, source: str = "basic.instance"
         if raw is None or raw == "":
             return default
         try:
-            return float(raw)
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError("non-finite")
+            return value
         except ValueError:
             raise ConfigError(f"{source}: {key} 必须是数字，实际是 {raw!r}") from None
 
+    window = _int("context_window", spec.context_window)
+    output_limit = _int("max_output_tokens", min(spec.max_output_tokens, max(1, window // 2)))
+    if window < 1024 or output_limit <= 0 or output_limit >= window:
+        raise ConfigError("Require context_window >= 1024 and 0 < max_output_tokens < context_window")
+    spec = replace(spec, context_window=window, max_output_tokens=output_limit)
     max_tokens = _int("max_tokens", DEFAULT_MAX_TOKENS)
     if max_tokens <= 0:
         raise ConfigError(f"{source}: max_tokens 必须为正")
@@ -137,9 +168,10 @@ def config_from_values(values: dict[str, str], *, source: str = "basic.instance"
     if not 0 <= temperature <= 2:
         raise ConfigError(f"{source}: temperature 必须在 [0, 2] 内")
 
-    effort = values.get("effort") or None
-    if effort is not None and effort not in spec.effort_levels:
-        raise ConfigError(f"{source}: effort 必须是 {spec.effort_levels} 之一，实际是 {effort!r}")
+    effort = values.get("reasoning_effort") or values.get("effort") or None
+    thinking = values.get("thinking", "auto")
+    if thinking not in {"auto", "on", "off"}:
+        raise ConfigError("thinking must be auto/on/off")
 
     api_key = values.get("api_key") or None
     if api_key and api_key.strip().lower() in _PLACEHOLDER_KEYS:
@@ -154,5 +186,45 @@ def config_from_values(values: dict[str, str], *, source: str = "basic.instance"
         turn_delay=turn_delay,
         temperature=temperature,
         effort=effort,
+        context_window=window,
+        max_output_tokens=output_limit,
+        thinking=thinking,
         extra=extra,
     )
+
+
+def validate_options(options: object) -> dict:
+    if not isinstance(options, dict):
+        raise ConfigError("model-options.json must be an object")
+    allowed = {"extra_body", "thinking_modes", "output_parameter", "send_temperature", "tools", "vision",
+               "reasoning_field", "require_reasoning", "prices"}
+    if set(options) - allowed:
+        raise ConfigError(f"Unknown model options: {sorted(set(options) - allowed)}")
+    reserved = {"model", "messages", "tools", "tool_choice", "stream", "max_tokens", "max_completion_tokens",
+                "temperature", "reasoning_effort"}
+    def body(value):
+        if not isinstance(value, dict) or set(value) & reserved:
+            raise ConfigError("extra_body must be an object without core request fields")
+    body(options.get("extra_body", {}))
+    modes = options.get("thinking_modes", {})
+    if not isinstance(modes, dict) or set(modes) - {"on", "off"}:
+        raise ConfigError("thinking_modes must map on/off")
+    for mapping in modes.values():
+        if not isinstance(mapping, dict) or set(mapping) - {"extra_body", "reasoning_effort"}:
+            raise ConfigError("Invalid thinking mode mapping")
+        body(mapping.get("extra_body", {}))
+        if "reasoning_effort" in mapping and not isinstance(mapping["reasoning_effort"], str):
+            raise ConfigError("Mapped reasoning_effort must be a string")
+    for key in ("send_temperature", "tools", "vision", "require_reasoning"):
+        if key in options and not isinstance(options[key], bool):
+            raise ConfigError(f"{key} must be a boolean")
+    if options.get("output_parameter", "max_tokens") not in {"max_tokens", "max_completion_tokens"}:
+        raise ConfigError("Invalid output_parameter")
+    if options.get("reasoning_field") not in {None, "reasoning_content", "reasoning"}:
+        raise ConfigError("Invalid reasoning_field")
+    return options
+
+
+def validate_thinking(config: InstanceConfig) -> None:
+    if config.thinking != "auto" and config.thinking not in config.options.get("thinking_modes", {}):
+        raise ConfigError("thinking on/off requires a corresponding model-options.json mapping")

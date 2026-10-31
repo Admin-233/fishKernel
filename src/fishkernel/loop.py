@@ -245,7 +245,7 @@ class Kernel:
         system_text = self.archive.system_text()
         tools = self.toolbox.specs()
         events = read_events(self.archive.events_path)
-        messages = build_messages(events, system_text)
+        messages = self._messages(events, system_text)
         pressure = self.meter.pressure(events=events, messages=messages, system_text=system_text, tools=tools)
         if self.compressor.should_compact(pressure):
             self.logger.info(f"上下文压力 {pressure} ≥ 阈值 {self.compressor.threshold}，触发压缩（{self.meter.describe()}）")
@@ -253,7 +253,7 @@ class Kernel:
             if outcome.compacted:
                 self.meter.invalidate()
                 events = read_events(self.archive.events_path)
-                messages = build_messages(events, system_text)
+                messages = self._messages(events, system_text)
                 pressure = self.meter.pressure(events=events, messages=messages, system_text=system_text, tools=tools)
         self.logger.info(f"上下文压力 {pressure} / 阈值 {self.compressor.threshold}（{self.meter.describe()}）")
 
@@ -290,6 +290,11 @@ class Kernel:
         self.events.append("turn/end", turn=turn, reason=why, slept_seconds=round(slept, 2))
         self._write_state("running")
 
+    def _messages(self, events, system_text):
+        return build_messages(events, system_text,
+                              reasoning_field=self.config.options.get("reasoning_field"),
+                              require_reasoning=self.config.options.get("require_reasoning", False))
+
     def _call_model(
         self, messages: list[dict], tools: list[dict]
     ) -> tuple[Completion, int, int]:
@@ -307,7 +312,7 @@ class Kernel:
             if not outcome.compacted:
                 raise
             self.meter.invalidate()
-            refreshed = build_messages(read_events(self.archive.events_path), self.archive.system_text())
+            refreshed = self._messages(read_events(self.archive.events_path), self.archive.system_text())
             prompt_seq = self.events.last_seq
             estimated = estimate_messages(refreshed) + estimate_tools(tools)
             return self.client.complete(refreshed, tools=tools, max_tokens=self.config.max_tokens), prompt_seq, estimated
@@ -320,7 +325,10 @@ class Kernel:
         self.events.append(
             "assistant/message",
             text=completion.text or "",
-            reasoning=str(reasoning)[:4000],
+            reasoning=str(reasoning),
+            reasoning_complete=True,
+            thinking=self.config.thinking,
+            reasoning_effort=self.config.effort,
             tool_calls=calls,
             usage=completion.usage,
             prompt_seq=prompt_seq,
