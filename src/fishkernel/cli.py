@@ -18,6 +18,7 @@ from .jobs import JobManager
 from .llm import ScriptedClient
 from .lock import LockError
 from .loop import Kernel
+from .platform import UnsupportedPlatformError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_cost.add_argument("directory")
     p_cost.add_argument("--json", action="store_true", help="输出 JSON")
 
+    p_plugin = sub.add_parser("plugin", help="管理统一插件接口")
+    p_plugin.add_argument("directory")
+    p_plugin.add_argument("action", choices=["list", "inspect", "validate", "enable", "disable", "restart", "reload"])
+    p_plugin.add_argument("id", nargs="?")
     return parser
 
 
@@ -86,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "plugin":
+            return _cmd_plugin(args)
         if args.command == "new":
             return _cmd_new(args)
         if args.command == "run":
@@ -104,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_web(args)
         if args.command == "trim":
             return _cmd_trim(args)
-    except (ArchiveError, ConfigError, ValueError, FileNotFoundError, LockError) as exc:
+    except (ArchiveError, ConfigError, ValueError, FileNotFoundError, LockError, UnsupportedPlatformError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
     parser.error("未知命令")
@@ -382,6 +389,34 @@ def _usage_totals(events) -> tuple[int, int, int, int | None]:
         if isinstance(completion, int):
             completion_total += completion
     return calls, prompt_total, completion_total, last_prompt
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
+
+
+def _cmd_plugin(args):
+    from .plugins import manifest
+    from .atomic import write_atomic
+    import uuid
+    archive = _open_archive(args.directory)
+    if args.action in {"inspect", "validate"}:
+        print(json.dumps(manifest(archive.root, args.id), ensure_ascii=False, indent=2))
+    elif args.action == "list":
+        path = archive.runtime_dir / "plugins" / "status.json"
+        print(path.read_text(encoding="utf-8") if path.exists() else "[]")
+    else:
+        from .platform import require_runtime
+        require_runtime()
+        if args.action != "disable":
+            manifest(archive.root, args.id)
+        identity = uuid.uuid4().hex + ".json"
+        directory = archive.control_dir / "commands"
+        if directory.exists() and len(list(directory.glob("*.json"))) >= 128:
+            raise ValueError("Too many pending management commands")
+        write_atomic(directory / identity, json.dumps({"action": args.action, "id": args.id}))
+        print(f"已排队；内核在请求边界执行。结果：{archive.control_dir / 'responses' / identity}")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

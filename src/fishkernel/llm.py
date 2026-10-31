@@ -36,6 +36,7 @@ class Completion:
     usage: dict[str, int] = field(default_factory=dict)
     finish_reason: str = "stop"
     model: str = ""
+    usage_call_id: str | None = None
 
     @property
     def prompt_tokens(self) -> int:

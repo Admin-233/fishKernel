@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import signal
 import time
 import traceback
+import hashlib
 from pathlib import Path
 
 from .archive import Archive, save_kernel_state
@@ -17,11 +17,13 @@ from .constants import MAX_TOOL_CALLS_PER_TURN
 from .control import Control
 from .events import EventLog, read_events
 from .jobs import Job, JobManager
-from .llm import Completion, ContextOverflowError, LLMClient, OpenAIClient
+from .llm import Completion, ContextOverflowError, LLMClient, OpenAIClient, LLMError
+from .coordinator import CoordinatedClient
+from .plugins import PluginManager
 from .archive import ArchiveError
 from .config import ConfigError
 from .lock import InstanceLock, LockError
-from .messages import build_messages
+from .messages import build_messages, ProjectionError
 from .restart import spawn_successor
 from .spill import cleanup as spill_cleanup
 from .tokens import TokenMeter, estimate_messages, estimate_tools
@@ -30,7 +32,7 @@ from .tools import ToolBox
 
 # 这些错误说明存档或配置本身有问题，重试多少次都不会自愈。
 # 遇到就停下并返回非零，把问题暴露出来让人处理 —— 空转只会烧时间。
-FATAL_ERRORS: tuple[type[BaseException], ...] = (ArchiveError, ConfigError, OSError)
+FATAL_ERRORS: tuple[type[BaseException], ...] = (ArchiveError, ConfigError, ProjectionError, OSError)
 
 
 def _is_fatal(exc: BaseException) -> bool:
@@ -81,7 +83,18 @@ class Kernel:
         self.lock = InstanceLock(self.archive.lock_path)
         self.meter = TokenMeter()
         self.toolbox = ToolBox(self.archive, self.jobs, self.control, self.events)
-        self.client: LLMClient = client or OpenAIClient(self.config)
+        self._raw_client = client or OpenAIClient(self.config)
+        self._injected_client = client is not None
+        self.plugins = PluginManager(self.archive, self.control, self.events, self.logger)
+        self.toolbox.plugins = self.plugins
+        self._servicing = False
+        self._last_service = 0.0
+        self.plugins.service = self._service
+        self.control.service = self._service
+        self.control.stop_requested = lambda: self._stop
+        self.client = CoordinatedClient(self._raw_client, self._service, self.events, self.config)
+        self._config_stamp = self._config_signature()
+        self._config_blocked = False
         if client is None:
             # 没有 Key 就在启动时报错，而不是每轮失败一次
             self.config.require_api_key()
@@ -103,6 +116,7 @@ class Kernel:
             MemoryStore(self.archive).recover(read_events(self.archive.events_path))
             return self._run_locked()
         finally:
+            self.plugins.close()
             self.events.close()
             self.lock.release()
             self._restore_signals()
@@ -142,9 +156,13 @@ class Kernel:
         if self.compressor.recover_stale():
             self.logger.warn("修复了上次未完成的压缩事务")
 
+        self.plugins.start()
         failures = 0
         try:
             while True:
+                self._service()
+                self._reload_config()
+                self._commands()
                 if self._stop:
                     reason = "signal"
                     break
@@ -166,6 +184,13 @@ class Kernel:
                     time.sleep(0.5)
                     continue
 
+                if self._config_blocked:
+                    self._write_state("config_blocked")
+                    if self.max_turns:
+                        reason, exit_code = "config_blocked", 2
+                        break
+                    time.sleep(0.2)
+                    continue
                 self.turns += 1
                 try:
                     self._turn(self.turns, state)
@@ -175,6 +200,8 @@ class Kernel:
                 except Exception as exc:  # noqa: BLE001 - 内核必须活下来
                     failures += 1
                     fatal = _is_fatal(exc)
+                    if isinstance(exc, LLMError) and not exc.retryable:
+                        self._config_blocked = True
                     self.logger.error(traceback.format_exc(limit=8).strip())
                     self.events.append(
                         "error",
@@ -253,6 +280,7 @@ class Kernel:
             if outcome.compacted:
                 self.meter.invalidate()
                 events = read_events(self.archive.events_path)
+                system_text = self.archive.system_text()
                 messages = self._messages(events, system_text)
                 pressure = self.meter.pressure(events=events, messages=messages, system_text=system_text, tools=tools)
         self.logger.info(f"上下文压力 {pressure} / 阈值 {self.compressor.threshold}（{self.meter.describe()}）")
@@ -289,6 +317,64 @@ class Kernel:
             self.events.append("delay", seconds=round(slept, 2), reason=why)
         self.events.append("turn/end", turn=turn, reason=why, slept_seconds=round(slept, 2))
         self._write_state("running")
+
+    def _service(self):
+        if self._servicing or time.monotonic() - self._last_service < 0.05:
+            return
+        self._servicing = True
+        self._last_service = time.monotonic()
+        try:
+            self.plugins.poll()
+            for job in self.jobs.tick():
+                self._report_job(job)
+        finally:
+            self._servicing = False
+
+    def _config_signature(self):
+        values = []
+        for path in (self.archive.config_path, self.archive.root / "model-options.json"):
+            values.append(hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "missing")
+        return tuple(values)
+
+    def _reload_config(self):
+        stamp = self._config_signature()
+        if stamp == self._config_stamp:
+            return
+        self._config_stamp = stamp
+        try:
+            config = load_config(self.archive.root)
+            if not self._injected_client:
+                config.require_api_key()
+                self._raw_client = OpenAIClient(config)
+        except ConfigError as exc:
+            self._config_blocked = True
+            self.logger.error(str(exc))
+            return
+        self.config = config
+        self.client.config = config
+        self.client.client = self._raw_client
+        self.compressor.config = config
+        self.meter.invalidate()
+        self._config_blocked = False
+        self.events.append("system/message", kind="config", text="模型配置已在请求边界重新加载")
+
+    def _commands(self):
+        directory = self.archive.control_dir / "commands"
+        if not directory.is_dir():
+            return
+        for path in sorted(directory.glob("*.json"))[:16]:
+            result_path = self.archive.control_dir / "responses" / path.name
+            if result_path.exists():
+                path.unlink()
+                continue
+            try:
+                command = json.loads(path.read_text(encoding="utf-8"))
+                result = self.plugins.manage(command.get("action"), command.get("id"))
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)[:500]}
+            from .atomic import write_atomic
+            write_atomic(result_path, json.dumps(result, ensure_ascii=False))
+            path.unlink()
 
     def _messages(self, events, system_text):
         return build_messages(events, system_text,
@@ -331,6 +417,7 @@ class Kernel:
             reasoning_effort=self.config.effort,
             tool_calls=calls,
             usage=completion.usage,
+            usage_call_id=completion.usage_call_id,
             prompt_seq=prompt_seq,
             prompt_tokens_actual=completion.prompt_tokens,
             pressure_tokens=pressure,
@@ -343,6 +430,12 @@ class Kernel:
     def _run_tool_calls(self, completion: Completion) -> None:
         calls = completion.tool_calls
         for call in calls[:MAX_TOOL_CALLS_PER_TURN]:
+            self._service()
+            if self.control.has_pending() or self._stop or self.control.read_state()["run"] != "run":
+                self.events.append("tool/result", call_id=call.id, name=call.name, ok=False,
+                                   output=json.dumps({"ok": False, "error": {"code": "INTERRUPTED", "not_executed": True}}),
+                                   duration_ms=0)
+                continue
             result = self.toolbox.dispatch(call.name, call.arguments, call_id=call.id)
             self.events.append(
                 "tool/result",
@@ -423,6 +516,9 @@ class Kernel:
                 "model": self.config.model,
                 "status": status,
                 "turn": self.turns,
+                "thinking": self.config.thinking,
+                "reasoning_effort": self.config.effort,
+                "plugins": self.plugins.status(),
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             },
         )

@@ -255,10 +255,16 @@ class ToolBox:
         self.jobs = jobs
         self.control = control
         self.events = events
+        self.plugins = None
 
     # ---- 元信息 ----
     def specs(self) -> list[dict[str, Any]]:
-        return TOOL_SPECS
+        management = {"type": "function", "function": {
+            "name": "plugin_manage", "description": "Inspect, validate, enable, disable, restart or reload Plugins/<id>/plugin.json extensions.",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["list", "inspect", "validate", "enable", "disable", "restart", "reload"]},
+                "id": {"type": "string"}}, "required": ["action"], "additionalProperties": False}}}
+        return [*TOOL_SPECS, management, *(self.plugins.specs() if self.plugins else [])]
 
     # ---- 分发 ----
     def dispatch(self, name: str, arguments: str | dict[str, Any], *, call_id: str = "") -> ToolResult:
@@ -266,6 +272,8 @@ class ToolBox:
         try:
             args = self._parse_arguments(arguments)
             handler: Callable[[dict[str, Any]], dict[str, Any]] = getattr(self, f"_tool_{name}", None)  # type: ignore[assignment]
+            if handler is None and name.startswith("plugin_") and self.plugins is not None:
+                handler = lambda arguments: self.plugins.call(name, arguments)
             if handler is None:
                 raise _ToolError("unknown_tool", f"没有名为 {name} 的工具")
             # 注意：handler 返回的 __images__ 会在下方被摘出，见 _finish_result
@@ -296,13 +304,18 @@ class ToolBox:
         except Exception as exc:  # noqa: BLE001 - 工具错误必须成为模型可读的返回值
             result = ToolResult(
                 ok=False,
-                payload={"ok": False, "error": {"code": "tool_crash", "message": f"{type(exc).__name__}: {exc}"}},
+                payload={"ok": False, "error": {"code": getattr(exc, "code", "tool_crash"), "message": f"{type(exc).__name__}: {exc}"}},
                 name=name,
                 call_id=call_id,
                 spill_dir=self.archive.spill_dir,
             )
         result.duration_ms = int((time.monotonic() - started) * 1000)
         return result
+
+    def _tool_plugin_manage(self, args):
+        if self.plugins is None:
+            raise _ToolError("unavailable", "Plugin host is not running")
+        return self.plugins.manage(args.get("action"), args.get("id"))
 
     @staticmethod
     def _parse_arguments(arguments: str | dict[str, Any]) -> dict[str, Any]:
@@ -405,6 +418,8 @@ class ToolBox:
             raise _ToolError("not_found", f"文件不存在：{path}")
         if path.is_dir():
             raise _ToolError("is_dir", f"{path} 是目录，请用 list_dir")
+        if not path.is_file():
+            raise _ToolError("special_file", "Only regular files can be read")
         try:
             with open(path, "rb") as handle:
                 head = handle.read(8192)
@@ -428,11 +443,14 @@ class ToolBox:
         try:
             with open(path, "rb") as handle:
                 for _ in range(offset):
-                    if handle.readline() == b"":
+                    skipped = handle.readline(MAX_READ_BYTES + 1)
+                    if len(skipped) > MAX_READ_BYTES:
+                        raise _ToolError("line_too_long", "Cannot skip an oversized line; use byte-oriented processing")
+                    if skipped == b"":
                         break
                 for _ in range(limit):
                     start_position = handle.tell()
-                    raw_line = handle.readline()
+                    raw_line = handle.readline(MAX_READ_BYTES + 1)
                     if raw_line == b"":
                         break
                     if bytes_used + len(raw_line) > MAX_READ_BYTES:
@@ -449,7 +467,7 @@ class ToolBox:
                     bytes_used += len(raw_line)
                     lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
                 else:
-                    if handle.readline() != b"":
+                    if handle.read(1) != b"":
                         has_more = True
         except OSError as exc:
             raise _ToolError("io_error", f"读取失败：{exc}") from None
@@ -513,6 +531,8 @@ class ToolBox:
         label = args.get("label")
         timeout = _as_int(args.get("timeout_seconds"), 0, minimum=0)
         job = self.jobs.start(command, cwd=cwd, label=label, timeout_seconds=timeout)
+        if self.events is not None:
+            self.events.append("job/start", job_id=job.id, command=job.command, cwd=job.cwd)
         return {
             "job_id": job.id,
             "command": job.command,

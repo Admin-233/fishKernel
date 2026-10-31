@@ -14,6 +14,8 @@ import signal
 import subprocess
 import time
 import uuid
+import threading
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +23,7 @@ from pathlib import Path
 from .archive import Archive
 from .atomic import write_atomic
 from .constants import JOBS_KEEP_DIRS
+from .platform import require_runtime, process_identity, process_alive, terminate_group
 
 
 def _now() -> str:
@@ -59,6 +62,7 @@ class Job:
     ended_at: str | None = None
     timeout_seconds: float = 0.0
     adopted: bool = False
+    identity: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -73,6 +77,7 @@ class Job:
             "ended_at": self.ended_at,
             "timeout_seconds": self.timeout_seconds,
             "adopted": self.adopted,
+            "identity": self.identity,
         }
 
     @classmethod
@@ -89,6 +94,7 @@ class Job:
             ended_at=raw.get("ended_at"),
             timeout_seconds=float(raw.get("timeout_seconds") or 0.0),
             adopted=bool(raw.get("adopted")),
+            identity=raw.get("identity"),
         )
 
 
@@ -96,6 +102,9 @@ class JobManager:
     def __init__(self, archive: Archive):
         self.archive = archive
         self._procs: dict[str, subprocess.Popen] = {}
+        self._notices: list[Job] = []
+        self._overflow: set[str] = set()
+        self._last_cleanup = 0.0
 
     # ---- 路径 ----
     def job_dir(self, job_id: str) -> Path:
@@ -121,6 +130,11 @@ class JobManager:
         label: str | None = None,
         timeout_seconds: float = 0.0,
     ) -> Job:
+        require_runtime()
+        if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+            raise ValueError("timeout must be finite and nonnegative")
+        if sum(j.status in {"running", "stopping"} for j in self.list()) >= 32:
+            raise ValueError("Maximum 32 active jobs")
         if not command.strip():
             raise ValueError("命令不能为空")
         workdir = Path(cwd).expanduser().resolve() if cwd else self.archive.root
@@ -143,13 +157,12 @@ class JobManager:
             "cwd": str(workdir),
             "stdin": subprocess.DEVNULL,
         }
-        if os.name == "posix":
-            popen_kwargs["start_new_session"] = True
-        else:
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        with open(out_path, "wb") as out_handle, open(err_path, "wb") as err_handle:
-            process = subprocess.Popen(command, stdout=out_handle, stderr=err_handle, **popen_kwargs)
+        popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kwargs)
         job.pid = process.pid
+        job.identity = process_identity(process.pid)
+        for pipe, path in ((process.stdout, out_path), (process.stderr, err_path)):
+            threading.Thread(target=self._capture, args=(job_id, pipe, path), daemon=True).start()
         self._procs[job_id] = process
         self._write_meta(job)
         return job
@@ -162,7 +175,10 @@ class JobManager:
             raise FileNotFoundError(f"任务不存在：{job_id}") from None
         except (OSError, ValueError) as exc:
             raise ValueError(f"任务元数据损坏：{job_id}（{exc}）") from None
-        return Job.from_dict(raw)
+        job = Job.from_dict(raw)
+        if job.status in {"running", "stopping"} and not job.identity and job.id not in self._procs:
+            job.status = "historical"
+        return job
 
     def list(self) -> list[Job]:
         if not self.archive.jobs_dir.is_dir():
@@ -183,7 +199,7 @@ class JobManager:
         for job in self.list():
             if job.status not in {"running", "stopping"}:
                 continue
-            if job.pid and self._alive(job.pid):
+            if job.pid and process_alive(job.pid, job.identity):
                 job.adopted = True
                 job.status = "running"
                 self._write_meta(job)
@@ -206,7 +222,7 @@ class JobManager:
                 continue
             process = self._procs.get(job.id)
             exit_code = process.poll() if process is not None else None
-            if process is None and job.pid and not self._alive(job.pid):
+            if process is None and job.pid and not process_alive(job.pid, job.identity):
                 self._settle(job, "failed", None)
                 settled.append(job)
                 continue
@@ -215,6 +231,10 @@ class JobManager:
                 self._settle(job, status, exit_code)
                 settled.append(job)
                 continue
+            if job.id in self._overflow:
+                self._terminate(job)
+                self._settle(job, "output_limit", None)
+                continue
             if job.timeout_seconds > 0:
                 started = _started_timestamp(job.started_at)
                 # 时间戳解析不出来时不敢猜：宁可让任务继续跑，也不要误杀。
@@ -222,7 +242,11 @@ class JobManager:
                     self._terminate(job)
                     self._settle(job, "timeout", None)
                     settled.append(job)
-        return settled
+        if time.monotonic() - self._last_cleanup > 60:
+            self._cleanup_old_jobs()
+            self._last_cleanup = time.monotonic()
+        notices, self._notices = self._notices, []
+        return notices
 
     def wait(self, job_id: str, timeout_seconds: float = 30.0) -> Job:
         deadline = time.monotonic() + max(0.0, timeout_seconds)
@@ -242,7 +266,7 @@ class JobManager:
                     return self.load(job_id)
             else:
                 time.sleep(0.1)
-                if job.pid and not self._alive(job.pid):
+                if job.pid and not process_alive(job.pid, job.identity):
                     self._settle(job, "failed", None)
                     return self.load(job_id)
             if time.monotonic() >= deadline:
@@ -298,50 +322,45 @@ class JobManager:
             except Exception:
                 pass
         self._write_meta(job)
+        self._notices.append(job)
 
     def _terminate(self, job: Job) -> None:
+        if job.pid and job.identity:
+            terminate_group(job.pid, job.identity)
         process = self._procs.get(job.id)
         if process is not None:
             try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
                 process.kill()
-            except Exception:
-                pass
-        if not job.pid:
-            return
-        if os.name == "posix":
-            try:
-                os.killpg(os.getpgid(job.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                try:
-                    os.kill(job.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-        else:
-            try:
-                subprocess.run(
-                    ["taskkill", "/T", "/F", "/PID", str(job.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            except OSError:
-                pass
 
     @staticmethod
     def _alive(pid: int) -> bool:
+        return process_alive(pid)
+
+    def _capture(self, job_id, pipe, path):
+        remaining = 16 * 1024 * 1024
         try:
-            os.kill(pid, 0)
-        except (ProcessLookupError, ValueError):
-            return False
-        except PermissionError:
-            return True
-        return True
+            with pipe, path.open("wb") as handle:
+                while True:
+                    block = pipe.read1(8192)
+                    if not block:
+                        break
+                    accepted = block[:remaining]
+                    handle.write(accepted)
+                    handle.flush()
+                    remaining -= len(accepted)
+                    if len(accepted) < len(block):
+                        self._overflow.add(job_id)
+        except OSError:
+            self._overflow.add(job_id)
 
     def _cleanup_old_jobs(self) -> None:
         if not self.archive.jobs_dir.is_dir():
             return
         entries = sorted(
-            (path for path in self.archive.jobs_dir.iterdir() if path.is_dir()),
+            (self.job_dir(job.id) for job in self.list()
+             if job.status not in {"running", "stopping", "historical"}),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )

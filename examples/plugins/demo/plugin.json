@@ -1,0 +1,10 @@
+{
+  "id": "demo",
+  "protocol": 1,
+  "command": ["{python}", "main.py"],
+  "timeout": 30,
+  "tools": [
+    {"name": "echo", "description": "Return the supplied text", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"], "additionalProperties": false}},
+    {"name": "wait", "description": "Cancellable foreground wait", "parameters": {"type": "object", "properties": {"seconds": {"type": "number", "minimum": 0, "maximum": 25}}, "required": ["seconds"], "additionalProperties": false}}
+  ]
+}

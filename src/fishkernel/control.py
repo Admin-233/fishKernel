@@ -31,6 +31,8 @@ class Control:
         self.archive = archive
         self._state_cache: dict[str, object] = {}
         self._offset_cache: int | None = None
+        self.service = lambda: None
+        self.stop_requested = lambda: False
 
     # ---- 状态 ----
     def read_state(self) -> dict[str, object]:
@@ -168,7 +170,8 @@ class Control:
 
     def consume_wake(self) -> bool:
         """存在唤醒请求就消费掉（只生效一次）。"""
-        if self.has_pending():
+        self.service()
+        if self.stop_requested() or self.has_pending():
             return True
         try:
             self.archive.wake_path.unlink()
@@ -211,8 +214,9 @@ class Control:
         if not math.isfinite(seconds):
             raise ValueError("Sleep must be finite")
         if seconds <= 0:
+            self.service()
             state = self.read_state()
-            if state["run"] == "stop":
+            if self.stop_requested() or state["run"] == "stop":
                 return 0.0, "stop"
             if state["run"] == "pause":
                 return 0.0, "pause"
@@ -222,8 +226,9 @@ class Control:
         deadline = time.monotonic() + seconds
         slept = 0.0
         while True:
+            self.service()
             state = self.read_state()
-            if state["run"] == "stop":
+            if self.stop_requested() or state["run"] == "stop":
                 return slept, "stop"
             if state["run"] == "pause":
                 return slept, "pause"
