@@ -1,5 +1,7 @@
 # fishKernel
 
+**DO NOT USE THIS FRAMEWORK, while its maintained completely by LLM, it's experimental and unstable, also lack of standardization.**
+
 fishKernel 是一个持续运行的 Agent 内核：调用 OpenAI Chat Completions 格式的接口，
 执行基础工具和独立进程插件，并持久保存人格、长期记忆和对话上下文。
 
