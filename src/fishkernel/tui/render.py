@@ -313,15 +313,20 @@ def status_line(
     jobs_running: int,
     width: int,
     cost_yuan: float | None = None,
+    thinking: str = "服务端默认",
+    plugin_status: str = "",
+    cost_text: str = "",
 ) -> Line:
     parts = [
-        f" fishKernel · {name} · {run_word} · 第 {turn} 轮 · {model}",
+        f" fishKernel · {name} · {run_word} · 第 {turn} 轮 · 思考 {thinking} · {plugin_status} · {model}",
         f"压力 {_fmt_int(pressure)}/{_fmt_int(threshold)}",
         f"用量 {_fmt_int(prompt_total)}",
     ]
     # 成本比 token 数直观：用户真正关心的是余额还剩多少
     if cost_yuan is not None:
         parts.append(f"¥{cost_yuan:.2f}")
+    elif cost_text:
+        parts.append(cost_text)
     parts.append(f"任务 {jobs_running}")
     text = " · ".join(parts) + " "
     return Line(text, STYLE_STATUS)
@@ -377,7 +382,8 @@ def render_frame(
     while len(rows) < 1 + feed_height:
         rows.append(Line(""))
     rows.append(Line("─" * width, STYLE_DIM))
-    rows.append(Line("> " + input_text, STYLE_INPUT))
+    visible, shown_before = visible_input(input_text, cursor, width - 2)
+    rows.append(Line("> " + visible, STYLE_INPUT))
     rows.append(hint)
 
     painted: list[str] = []

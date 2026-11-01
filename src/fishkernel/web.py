@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,10 @@ from .control import Control
 from .events import Event, read_events
 from .jobs import JobManager
 from .tokens import UsageTotals, fold_usage_into
+from .usage import usage_events
+from .plugins import read_status
+from .lock import LockError
+from .platform import UnsupportedPlatformError
 from .web_page import PAGE
 
 DEFAULT_HOST = "127.0.0.1"
@@ -156,15 +161,17 @@ def build_snapshot(
         start = bisect.bisect_right(_seqs(events), after_seq)
         selected = events[start:]
         if len(selected) > SNAPSHOT_EVENT_CAP:
-            selected = selected[-SNAPSHOT_EVENT_CAP:]
+            selected = selected[:SNAPSHOT_EVENT_CAP]
 
+    next_cursor = selected[-1].seq if selected else after_seq
+    has_more = next_cursor < last_seq
     lines = [line for line in (project_event(event) for event in selected) if line is not None]
 
     config = _read_instance(archive)
     control = Control(archive).read_state()
     if usage is None:
         usage = UsageTotals()
-        fold_usage_into(usage, events)
+        fold_usage_into(usage, usage_events(archive))
     totals = usage
 
     # JobManager.list() 按目录名（proc-<hex>）排序，那是随机的；
@@ -186,6 +193,8 @@ def build_snapshot(
             "name": config.get("name") or archive.root.name,
             "root": str(archive.root),
             "kernel": load_kernel_state(archive),
+            "plugins": read_status(archive),
+            "thinking": config.get("thinking", "auto"),
             "control": control,
             "events": len(events),
             "last_seq": last_seq,
@@ -194,11 +203,14 @@ def build_snapshot(
                 "prompt_tokens": totals.prompt_tokens,
                 "output_tokens": totals.output_tokens,
                 "cache_hit_rate": round(totals.cache_hit_rate, 4),
-                "cost_yuan": round(totals.cost_yuan, 2),
+                "cost_yuan": round(totals.cost_yuan, 2) if totals.cost_yuan is not None else None,
+                "cost_text": totals.cost_text(),
             },
         },
         "events": lines,
-        "last_seq": last_seq,
+        "last_seq": next_cursor,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
         "jobs": jobs,
     }
 
@@ -299,7 +311,7 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
                 with state.lock:
                     snapshot = build_snapshot(
                         state.archive, after_seq=after, tail=tail, usage=state.usage.update(
-                            read_events(state.archive.events_path)
+                            usage_events(state.archive)
                         )
                     )
                 self._json(200, snapshot)
@@ -327,6 +339,12 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
             self._json(404, {"ok": False, "error": "没有这个路径"})
 
         def do_POST(self) -> None:  # noqa: N802
+            try:
+                self._post()
+            except (OSError, LockError, UnsupportedPlatformError) as exc:
+                self._json(503, {"ok": False, "error": str(exc)})
+
+        def _post(self) -> None:
             parsed = urlparse(self.path)
             if self._deny():
                 return
@@ -342,8 +360,12 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
                 if not isinstance(text, str) or not text.strip():
                     self._json(400, {"ok": False, "error": "消息不能为空"})
                     return
-                with state.lock:
-                    control.push_message(text.strip())
+                try:
+                    with state.lock:
+                        control.push_message(text.strip())
+                except (OSError, ValueError) as exc:
+                    self._json(503, {"ok": False, "error": str(exc)})
+                    return
                 self._json(200, {"ok": True})
                 return
 
@@ -363,7 +385,7 @@ def make_handler(state: WebState) -> type[BaseHTTPRequestHandler]:
                     result = {"run": control.read_state()["run"], "delay": control.read_state()["delay"]}
                 elif action == "delay":
                     value = payload.get("value")
-                    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
                         self._json(400, {"ok": False, "error": "delay 需要一个非负数"})
                         return
                     result = control.write_state(delay=float(value))

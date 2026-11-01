@@ -277,7 +277,7 @@ def test_usage_cache_matches_full_fold(archive, log):
     assert totals.prompt_tokens == full.prompt_tokens
     assert totals.cache_hit == full.cache_hit
     assert totals.cache_miss == full.cache_miss
-    assert abs(totals.cost_yuan - full.cost_yuan) < 1e-12
+    assert totals.cost_yuan == full.cost_yuan == None
 
 
 def test_usage_cache_ignores_already_folded(archive, log):

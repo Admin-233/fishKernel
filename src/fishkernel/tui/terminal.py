@@ -1,8 +1,4 @@
-"""跨平台终端后端：备用屏、尺寸、按键读取。
-
-不依赖 curses / termios 的第三方包：POSIX 用 termios+select，
-Windows 用 msvcrt + 开启 VT 转义支持。
-"""
+"""Linux terminal backend. The Terminal interface is the future platform adaptation boundary."""
 
 from __future__ import annotations
 
@@ -38,19 +34,6 @@ _SEQUENCES = {
     "\t": "TAB",
 }
 
-_WIN_CODES = {
-    "H": "UP",
-    "P": "DOWN",
-    "K": "LEFT",
-    "M": "RIGHT",
-    "G": "HOME",
-    "O": "END",
-    "S": "DELETE",
-    "I": "PGUP",
-    "Q": "PGDN",
-}
-
-
 def is_tty() -> bool:
     try:
         return sys.stdin.isatty() and sys.stdout.isatty()
@@ -65,6 +48,7 @@ class Terminal:
         self._old_attrs = None
         self._pending = ""
         self._decoder = None
+        self._escape_since = None
 
     # ---- 生命周期 ----
     def __enter__(self) -> "Terminal":
@@ -75,24 +59,22 @@ class Terminal:
         self.exit()
 
     def enter(self) -> None:
-        if os.name == "windows":
-            self._enable_vt()
-        else:
-            import codecs
-            import termios
-            import tty
-
-            self.fd = sys.stdin.fileno()
-            self._old_attrs = termios.tcgetattr(self.fd)
-            tty.setcbreak(self.fd)
-            self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        from ..platform import require_runtime
+        require_runtime()
+        import codecs
+        import termios
+        import tty
+        self.fd = sys.stdin.fileno()
+        self._old_attrs = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")
 
     def exit(self) -> None:
         try:
             self.write("\x1b[?25h\x1b[0m\x1b[?1049l")
         finally:
-            if os.name != "windows" and self._old_attrs is not None and self.fd is not None:
+            if self._old_attrs is not None and self.fd is not None:
                 import termios
 
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, self._old_attrs)
@@ -114,8 +96,8 @@ class Terminal:
 
     # ---- 输入 ----
     def read_keys(self, timeout: float) -> list[str]:
-        if os.name == "windows":
-            return self._read_keys_windows(timeout)
+        from ..platform import require_runtime
+        require_runtime()
         return self._read_keys_posix(timeout)
 
     def _read_keys_posix(self, timeout: float) -> list[str]:
@@ -129,7 +111,7 @@ class Terminal:
         except (OSError, ValueError):
             return []
         if not readable:
-            return []
+            return self._drain()
         try:
             data = _os.read(self.fd, 4096)
         except OSError:
@@ -147,13 +129,18 @@ class Terminal:
                 if self._pending.startswith(sequence):
                     self._pending = self._pending[len(sequence) :]
                     keys.append(name)
+                    self._escape_since = None
                     break
             else:
                 char = self._pending[0]
                 if char == "\x1b":
                     # 可能是没读完的转义序列，等下一次输入；超过 3 个字符就当单独的 ESC
                     if len(self._pending) < 3:
-                        return keys
+                        if self._escape_since is None:
+                            self._escape_since = time.monotonic()
+                        if time.monotonic() - self._escape_since < 0.05:
+                            return keys
+                    self._escape_since = None
                     self._pending = self._pending[1:]
                     keys.append("ESC")
                 elif ord(char) >= 32:
@@ -162,47 +149,3 @@ class Terminal:
                 else:
                     self._pending = self._pending[1:]
         return keys
-
-    def _read_keys_windows(self, timeout: float) -> list[str]:
-        import msvcrt
-
-        deadline = time.monotonic() + max(0.0, timeout)
-        keys: list[str] = []
-        while time.monotonic() < deadline:
-            if msvcrt.kbhit():
-                keys.extend(self._read_one_windows())
-                while msvcrt.kbhit():
-                    keys.extend(self._read_one_windows())
-                return keys
-            time.sleep(0.01)
-        return keys
-
-    def _read_one_windows(self) -> list[str]:
-        import msvcrt
-
-        char = msvcrt.getwch()
-        if char in ("\x00", "\xe0"):
-            code = msvcrt.getwch()
-            return [_WIN_CODES.get(code, "ESC")]
-        if char == "\r":
-            return ["ENTER"]
-        if char == "\x08":
-            return ["BACKSPACE"]
-        if char == "\x1b":
-            return ["ESC"]
-        if ord(char) >= 32:
-            return [char]
-        return []
-
-    @staticmethod
-    def _enable_vt() -> None:
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            handle = kernel32.GetStdHandle(-11)
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-        except Exception:  # noqa: BLE001 - 老终端不支持就算了，退化成无色
-            pass

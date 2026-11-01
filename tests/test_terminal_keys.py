@@ -16,7 +16,7 @@ from fishkernel.tui.terminal import Terminal
 
 def _term_with_pending(pending: str) -> Terminal:
     """构造一个只用于解析的 Terminal，不进入 raw 模式。"""
-    term = Terminal.__new__(Terminal)
+    term = Terminal()
     term._pending = pending
     return term
 

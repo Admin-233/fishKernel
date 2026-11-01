@@ -112,6 +112,25 @@ PAGE = r"""<!DOCTYPE html>
   "use strict";
   var after = 0;
   var first = true;
+  var timer = null, inFlight = false, immediate = false, sending = false;
+  var token = new URLSearchParams(location.search).get("token") || sessionStorage.getItem("fish-token") || "";
+  if (token) { sessionStorage.setItem("fish-token", token); history.replaceState(null, "", location.pathname); }
+  function request(url, options) {
+    options = options || {};
+    options.headers = Object.assign({}, options.headers || {}, token ? {"X-Fish-Token": token} : {});
+    return fetch(url, options).then(function (r) {
+      if (r.status === 403) {
+        var value = prompt("请输入控制台 token");
+        if (value !== null) { token = value; sessionStorage.setItem("fish-token", token); }
+        throw new Error("token 不匹配");
+      }
+      return r;
+    });
+  }
+  function refreshSoon() {
+    immediate = true;
+    if (!inFlight) { clearTimeout(timer); timer = setTimeout(poll, 0); }
+  }
   var evBox = document.getElementById("events");
   var jobBox = document.getElementById("jobs");
 
@@ -159,6 +178,7 @@ PAGE = r"""<!DOCTYPE html>
     }
 
     evBox.appendChild(div);
+    while (evBox.children.length > 2000) evBox.removeChild(evBox.firstChild);
     if (atBottom || first) evBox.scrollTop = evBox.scrollHeight;
   }
 
@@ -179,57 +199,66 @@ PAGE = r"""<!DOCTYPE html>
   function applyState(s) {
     if (!s) return;
     document.getElementById("k-status").textContent = (s.kernel && s.kernel.status) || "-";
+    var mode = (s.kernel && s.kernel.thinking) || s.thinking || "auto";
+    document.getElementById("k-status").textContent += " · 思考 " + (mode === "auto" ? "服务端默认" : mode);
+    var plugins = s.plugins || [];
+    document.getElementById("k-status").textContent += " · 插件 " + plugins.length + " / 异常 " + plugins.filter(function(p){return !!p.last_error;}).length;
     document.getElementById("k-turn").textContent = (s.kernel && s.kernel.turn) || 0;
     document.getElementById("k-run").textContent = (s.control && s.control.run) || "-";
     document.getElementById("k-events").textContent = s.events || 0;
     var u = s.usage || {};
     document.getElementById("k-cost").textContent =
-      (u.calls || 0) + " 次 / ¥" + (u.cost_yuan === undefined ? "-" : u.cost_yuan);
+      (u.calls || 0) + " 次 / " + (u.cost_text || "费用未知");
     document.title = (s.name || "fishKernel") + " · " + ((s.kernel && s.kernel.status) || "");
   }
 
   function poll() {
+    if (inFlight) return;
+    clearTimeout(timer); inFlight = true; immediate = false;
     var url = "/api/snapshot?after=" + after + (first ? "&tail=200" : "");
-    fetch(url, { cache: "no-store" })
+    request(url, { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (!data.ok) throw new Error(data.error || "bad response");
         applyState(data.state);
         (data.events || []).forEach(appendEvent);
-        if (typeof data.last_seq === "number") after = data.last_seq;
+        if (typeof data.next_cursor === "number") after = data.next_cursor;
+        immediate = immediate || !!data.has_more;
         renderJobs(data.jobs || []);
         first = false;
       })
       .catch(function (err) {
         document.getElementById("k-status").textContent = "离线";
       })
-      .then(function () { setTimeout(poll, 1000); });
+      .then(function () { inFlight = false; timer = setTimeout(poll, immediate ? 0 : 1000); });
   }
 
   function ctl(action, value) {
-    fetch("/api/ctl", {
+    request("/api/ctl", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: action, value: value })
     }).then(function (r) { return r.json(); }).then(function (d) {
       toast(d.ok ? ("已执行：" + action) : ("失败：" + (d.error || action)));
-      first = true; after = 0; evBox.innerHTML = "";
-      setTimeout(poll, 150);
-    });
+      refreshSoon();
+    }).catch(function (err) { toast("控制失败：" + err.message); });
   }
 
   function say() {
     var input = document.getElementById("msg");
     var text = input.value.trim();
-    if (!text) return;
-    input.value = "";
-    fetch("/api/say", {
+    if (!text || sending) return;
+    sending = true;
+    request("/api/say", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: text })
     }).then(function (r) { return r.json(); }).then(function (d) {
       toast(d.ok ? "已投递" : ("失败：" + (d.error || "")));
-    });
+      if (d.ok && input.value.trim() === text) input.value = "";
+      if (d.ok) refreshSoon();
+    }).catch(function (err) { toast("发送失败：" + err.message); })
+      .then(function () { sending = false; });
   }
 
   document.getElementById("b-pause").onclick = function () { ctl("pause"); };

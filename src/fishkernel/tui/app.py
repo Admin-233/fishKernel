@@ -13,7 +13,7 @@ from collections import deque
 from pathlib import Path
 
 from ..archive import Archive, load_kernel_state
-from ..config import load_config
+from ..config import load_config, ConfigError
 from ..control import Control
 from ..events import Event, read_events
 from ..jobs import JobManager
@@ -77,39 +77,46 @@ class EventTail:
         self.initial_bytes = initial_bytes
         self.offset = 0
         self.partial = b""
+        self.identity = None
+        self.reset = False
 
     def prime(self) -> list[Event]:
-        if not self.path.exists():
+        try:
+            with self.path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                self.identity = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                self.partial = b""
+                start = max(0, stat.st_size - self.initial_bytes) if self.initial_bytes > 0 else 0
+                handle.seek(start)
+                raw = handle.read(stat.st_size - start)
+                self.offset = handle.tell()
+        except FileNotFoundError:
             return []
-        size = self.path.stat().st_size
-        start = max(0, size - self.initial_bytes) if self.initial_bytes > 0 else 0
-        with open(self.path, "rb") as handle:
-            handle.seek(start)
-            raw = handle.read()
         if start > 0:
             newline = raw.find(b"\n")
             if newline < 0:
-                self.offset = size
                 return []
-            raw = raw[newline + 1 :]
-            self.offset = start + newline + 1
-        else:
-            self.offset = len(raw)
+            raw = raw[newline + 1:]
         return self._parse(raw)
 
     def poll(self) -> list[Event]:
-        if not self.path.exists():
+        try:
+            with self.path.open("rb") as handle:
+                stat = os.fstat(handle.fileno())
+                identity = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                self.reset = bool(self.identity and (self.identity[0] != identity[0] or stat.st_size < self.offset
+                                  or (stat.st_size == self.offset and self.identity[1] != identity[1])))
+                self.identity = identity
+                if self.reset:
+                    self.offset = 0
+                    self.partial = b""
+                if stat.st_size == self.offset:
+                    return []
+                handle.seek(self.offset)
+                raw = handle.read(stat.st_size - self.offset)
+                self.offset = handle.tell()
+        except FileNotFoundError:
             return []
-        size = self.path.stat().st_size
-        if size < self.offset:
-            self.offset = 0
-            self.partial = b""
-        if size == self.offset:
-            return []
-        with open(self.path, "rb") as handle:
-            handle.seek(self.offset)
-            raw = handle.read()
-        self.offset = size
         return self._parse(raw)
 
     def _parse(self, raw: bytes) -> list[Event]:
@@ -232,11 +239,14 @@ class TuiApp:
                     turns.append(("我", text))
 
         self._chat_turns = turns
+        self._chat_ids = [e.seq for e in self.events
+                          if e.type in {"user/message", "assistant/message"} and str(e.data.get("text", "")).strip()]
         # 右栏：完整记录（工具调用 / 工具结果 / 思维链）。
         # 只取「过程类」事件，对话正文已经由左栏承担，避免两边重复。
         detail: list[Line] = []
+        detail_ids = []
         total = len(self.events)
-        recent_events = list(itertools.islice(self.events, max(0, total - 300), total))
+        recent_events = list(itertools.islice(self.events, 0, total))
         for event in recent_events:
             if event.type in {"user/message", "delay", "turn/start", "turn/end",
                               "session/start", "session/end"}:
@@ -251,78 +261,64 @@ class TuiApp:
                 detail.append(Line(f"  {ok} {data.get('name','?')} · {out_len} 字符", STYLE_DIM))
                 continue
             detail.extend(lines)
+            detail_ids.extend((event.seq, i) for i in range(len(lines)))
         self._detail_lines = detail
+        self._detail_ids = detail_ids
+
+    def _pane(self, entries, height, name):
+        page_name = "_" + name + "_page"
+        anchor_name = "_" + name + "_anchor"
+        offset = getattr(self, page_name, 0)
+        anchor = getattr(self, anchor_name, None)
+        if offset and anchor is not None:
+            candidates = [i for i, (_, key) in enumerate(entries)
+                          if key[:2] == anchor[:2] and key[2] <= anchor[2]]
+            if candidates:
+                offset = max(0, len(entries) - candidates[-1] - height)
+        offset = max(0, min(offset, max(0, len(entries) - height)))
+        setattr(self, page_name, offset)
+        end = len(entries) - offset
+        shown = entries[max(0, end - height):end]
+        setattr(self, anchor_name, shown[0][1] if offset and shown else None)
+        setattr(self, "_" + name + "_total", len(entries))
+        return [line for line, _ in shown]
 
     def _chat_lines(self, width: int, height: int | None = None) -> list[Line]:
-        """构造顶部分栏区：左边是「人机对话」，右边是「完整记录（含思维链）」。
-
-        左边的信息密度低但最重要（我说了什么、你说了什么）；
-        右边的信息密度高（工具调用、工具输出、思维链），并且变化快。
-        分成两栏后，左侧不会被工具刷屏冲掉。
-        """
-        left_w = max(20, int(width * self.CHAT_SPLIT) - 1)
-        right_w = max(10, width - left_w - 1)
-        # 占满消息区：高度 - 状态(1) - 分隔(1) - 输入(1) - 提示(1)
-        rows_n = height if height and height > 0 else self.CHAT_ROWS or 8
-
-        # ---- 左栏：人机对话（支持翻页）----
-        left: list[Line] = []
-        turns_all = getattr(self, "_chat_turns", [])
-        # 每条消息占一行，按行数翻页；_left_page 表示从末尾往回偏移多少行
-        end = max(0, len(turns_all) - self._left_page)
-        start = max(0, end - rows_n)
-        recent = turns_all[start:end]
-        for label, text in recent:
-            # 保留原文的换行结构：逐行处理，只在行内折叠多余空白。
-            # 之前用 " ".join(text.split()) 会把换行全压成空格，
-            # 用户的段落、我的列表全挤成一整行，这是"换行显示不对"的根因。
-            raw_lines = [ln.rstrip() for ln in str(text).splitlines()]
-            while raw_lines and not raw_lines[0].strip():
-                raw_lines.pop(0)
-            while raw_lines and not raw_lines[-1].strip():
-                raw_lines.pop()
-
+        left_w = max(8, int(width * self.CHAT_SPLIT) - 1)
+        right_w = max(8, width - left_w - 1)
+        rows_n = height or max(1, self._cur_height - 4)
+        left = []
+        ids = getattr(self, "_chat_ids", [])
+        for index, (label, text) in enumerate(getattr(self, "_chat_turns", [])):
+            identity = ids[index] if index < len(ids) else index
             prefix = f"{label}│"
-            body_w = max(4, left_w - display_width(prefix))
-            indent = " " * display_width(prefix)
+            body_w = max(1, left_w - display_width(prefix))
             style = STYLE_USER if label == "你" else STYLE_ASSISTANT
-
-            segments: list[str] = []
-            for raw in raw_lines:
-                line_text = " ".join(raw.split())
-                if not line_text:
-                    segments.append("")          # 原文的段落间隙保留成空行
-                else:
-                    segments.extend(wrap_text(line_text, body_w))
-
-            if not segments:
-                segments = [""]
-            for idx, seg in enumerate(segments):
-                head = prefix if idx == 0 else indent
-                left.append(Line(f"{head}{seg}", style))
-        left = left[-rows_n:]
-
-        # ---- 右栏：完整记录里的最近若干条（工具调用/结果/思维链）----
-        right: list[Line] = []
-        all_detail = getattr(self, "_detail_lines", [])
-        end_r = max(0, len(all_detail) - self._right_page)
-        start_r = max(0, end_r - rows_n * 2)   # 多取一些，跳过空行后仍能填满
-        for line in all_detail[start_r:end_r]:
-            txt = " ".join(line.text.split())
-            if not txt:
-                continue
-            right.append(Line(truncate(txt, right_w), line.style))
-        right = right[-rows_n:]
-
-        # ---- 拼成两栏 ----
-        out: list[Line] = []
+            first = True
+            for logical_line, raw in enumerate(str(text).splitlines() or [""]):
+                position = 0
+                for segment in wrap_text(raw.expandtabs(4), body_w) or [""]:
+                    head = prefix if first else " " * display_width(prefix)
+                    left.append((Line(head + segment, style), (identity, logical_line, position)))
+                    position += len(segment)
+                    first = False
+        right = []
+        detail_ids = getattr(self, "_detail_ids", [])
+        for index, line in enumerate(getattr(self, "_detail_lines", [])):
+            identity, logical_line = detail_ids[index] if index < len(detail_ids) else (index, 0)
+            position = 0
+            for segment in wrap_text(line.text, right_w) or [""]:
+                right.append((Line(segment, line.style), (identity, logical_line, position)))
+                position += len(segment)
+        left = self._pane(left, rows_n, "left")
+        right = self._pane(right, rows_n, "right")
+        result = []
         for i in range(rows_n):
             l = left[i].text if i < len(left) else ""
-            r = right[i].text if i < len(right) else ""
-            pad = " " * max(0, left_w - display_width(l))
-            style = left[i].style if i < len(left) else STYLE_DIM
-            out.append(Line(f"{l}{pad}│{r}", style))
-        return out
+            rr = right[i].text if i < len(right) else ""
+            result.append(Line(l + " " * max(0, left_w - display_width(l)) + "│" + rr,
+                               left[i].style if i < len(left) else STYLE_DIM))
+        return result
 
     def _rebuild(self, width: int) -> None:  # noqa: D401
         self._refresh_chat()
@@ -334,6 +330,13 @@ class TuiApp:
         self.scroll = 0
 
     def _status(self, width: int) -> Line:
+        from ..plugins import read_status
+        from ..tokens import fold_usage
+        from ..usage import usage_events
+        try:
+            self.config = load_config(self.archive.root)
+        except ConfigError:
+            pass
         state = self.control.read_state()
         kernel = load_kernel_state(self.archive)
         run_word = "运行中"
@@ -345,16 +348,26 @@ class TuiApp:
             run_word = "已停止"
         elif not self._kernel_alive(kernel):
             run_word = "未运行"
+        if kernel.get("status") == "config_blocked":
+            run_word = "配置阻塞"
+        plugins = read_status(self.archive)
+        totals = fold_usage(usage_events(self.archive))
+        failures = sum(bool(p.get("last_error")) for p in plugins)
+        mode = kernel.get("thinking", self.config.thinking)
+        thinking = "服务端默认" if mode == "auto" else str(mode)
         return status_line(
             name=self.config.name,
             run_word=run_word,
             turn=int(kernel.get("turn") or 0),
-            model=self.config.model,
+            model=kernel.get("model", self.config.model),
             pressure=self._pressure,
             threshold=self.config.budget.threshold,
-            prompt_total=self._prompt_total,
+            prompt_total=totals.prompt_tokens,
             jobs_running=self._jobs_running,
             width=width,
+            thinking=thinking,
+            plugin_status=f"插件 {len(plugins)} / 异常 {failures}",
+            cost_text=totals.cost_text(),
         )
 
     def _hint(self) -> Line:
@@ -504,6 +517,8 @@ class TuiApp:
         changed = False
         new_lines: list[Line] = []
         events = self.tail.poll()
+        if self.tail.reset:
+            self.events.clear()
         if events:
             for event in events:
                 self.events.append(event)
@@ -551,37 +566,24 @@ class TuiApp:
         return changed
 
     # ---------------- 分栏翻页 ----------------
-    # 每次 PgUp/PgDn 翻多少行。固定 1 行，逐行阅读，不跳内容。
-    PAGE_STEP = 1
-
     def _page_step(self) -> int:
-        return self.PAGE_STEP
+        return max(1, self._cur_height - 5)
 
     def _page_by(self, delta: int) -> None:
-        """delta > 0 往回翻（更旧），delta < 0 往前翻（更新）。"""
-        if self._focus == "left":
-            total = len(getattr(self, "_chat_turns", []))
-            self._left_page = max(0, min(self._left_page + delta, max(0, total - 1)))
-            where = f"左栏 {self._left_page}/{max(0, total - 1)}"
-        else:
-            total = len(getattr(self, "_detail_lines", []))
-            self._right_page = max(0, min(self._right_page + delta, max(0, total - 1)))
-            where = f"右栏 {self._right_page}/{max(0, total - 1)}"
-        self._set_flash(f"已翻页 · {where}（Tab 切换栏）")
+        self._chat_lines(self._cur_width, max(1, self._cur_height - 4))
+        name = self._focus
+        total = getattr(self, "_" + name + "_total", 0)
+        height = max(1, self._cur_height - 4)
+        offset = getattr(self, "_" + name + "_page", 0)
+        setattr(self, "_" + name + "_page", max(0, min(offset + delta, max(0, total - height))))
+        setattr(self, "_" + name + "_anchor", None)
 
     def _page_to_start(self) -> None:
-        if self._focus == "left":
-            self._left_page = max(0, len(getattr(self, "_chat_turns", [])) - 1)
-        else:
-            self._right_page = max(0, len(getattr(self, "_detail_lines", [])) - 1)
-        self._set_flash("已跳到最早（End 回最新）")
+        self._page_by(10 ** 12)
 
     def _page_to_end(self) -> None:
-        if self._focus == "left":
-            self._left_page = 0
-        else:
-            self._right_page = 0
-        self._set_flash("已回到最新")
+        setattr(self, "_" + self._focus + "_page", 0)
+        setattr(self, "_" + self._focus + "_anchor", None)
 
     # ---------------- 按键 ----------------
     def _handle_key(self, key: str) -> None:
@@ -601,6 +603,9 @@ class TuiApp:
                 self._focus = "right" if self._focus == "left" else "left"
                 name = "左栏（对话）" if self._focus == "left" else "右栏（记录）"
                 self._set_flash(f"翻页焦点：{name}")
+                return
+            if key in {"UP", "DOWN"}:
+                self._page_by(1 if key == "UP" else -1)
                 return
             page = self._page_step()
             if key == "PGUP":
@@ -635,7 +640,13 @@ class TuiApp:
         if text.startswith(":"):
             self._command(text[1:].strip())
             return
-        self.control.push_message(text)
+        from ..lock import LockError
+        try:
+            self.control.push_message(text)
+        except (ValueError, OSError, LockError) as exc:
+            self.editor.set_text(text)
+            self._set_flash(f"投递失败，内容已保留：{exc}")
+            return
         self._set_flash(f"已发送（{len(text)} 字），等待内核读取")
 
     def _command(self, command: str) -> None:
@@ -680,30 +691,11 @@ class TuiApp:
 
     # ---------------- 信号与工具 ----------------
     def _kernel_alive(self, kernel: dict) -> bool:
-        pid = kernel.get("pid")
-        if not isinstance(pid, int) or pid <= 0:
-            return False
-        if os.name == "windows":
-            try:
-                import ctypes
-
-                synchronize = 0x00100000
-                handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, pid)  # type: ignore[attr-defined]
-                if not handle:
-                    return False
-                try:
-                    code = ctypes.c_ulong()
-                    ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))  # type: ignore[attr-defined]
-                    return bool(ok) and code.value == 259  # STILL_ACTIVE
-                finally:
-                    ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                return False
+        from ..platform import process_alive, UnsupportedPlatformError
         try:
-            os.kill(pid, 0)
-        except (ProcessLookupError, PermissionError, OSError):
+            return process_alive(kernel.get("pid"), kernel.get("process_identity"))
+        except UnsupportedPlatformError:
             return False
-        return True
 
     def _install_signals(self) -> None:
         def handler(signum, frame):  # noqa: ANN001, ARG001
