@@ -6,6 +6,7 @@ import os
 import json
 import math
 import re
+import hashlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -45,6 +46,17 @@ class InstanceConfig:
     max_output_tokens: int | None = None
     thinking: str = "auto"
     options: dict = field(default_factory=dict)
+
+    @property
+    def revision(self) -> str:
+        # API credentials are excluded; only request behavior identifies a profile.
+        value = {key: getattr(self, key) for key in ("model", "api_base", "max_tokens", "temperature",
+                 "effort", "context_window", "max_output_tokens", "thinking", "options")}
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:16]
+
+    @property
+    def effective_effort(self):
+        return self.options.get("thinking_modes", {}).get(self.thinking, {}).get("reasoning_effort", self.effort)
 
     @property
     def spec(self) -> ModelSpec:
@@ -196,6 +208,10 @@ def config_from_values(values: dict[str, str], *, source: str = "basic.instance"
 def validate_options(options: object) -> dict:
     if not isinstance(options, dict):
         raise ConfigError("model-options.json must be an object")
+    try:
+        json.dumps(options, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Model options must contain finite JSON values") from exc
     allowed = {"extra_body", "thinking_modes", "output_parameter", "send_temperature", "tools", "vision",
                "reasoning_field", "require_reasoning", "prices"}
     if set(options) - allowed:
@@ -218,10 +234,23 @@ def validate_options(options: object) -> dict:
     for key in ("send_temperature", "tools", "vision", "require_reasoning"):
         if key in options and not isinstance(options[key], bool):
             raise ConfigError(f"{key} must be a boolean")
-    if options.get("output_parameter", "max_tokens") not in {"max_tokens", "max_completion_tokens"}:
+    if not isinstance(options.get("output_parameter", "max_tokens"), str) or options.get("output_parameter", "max_tokens") not in {"max_tokens", "max_completion_tokens"}:
         raise ConfigError("Invalid output_parameter")
-    if options.get("reasoning_field") not in {None, "reasoning_content", "reasoning"}:
+    if options.get("reasoning_field") is not None and (not isinstance(options["reasoning_field"], str) or options["reasoning_field"] not in {"reasoning_content", "reasoning"}):
         raise ConfigError("Invalid reasoning_field")
+    if options.get("require_reasoning") and not options.get("reasoning_field"):
+        raise ConfigError("require_reasoning needs a reasoning_field")
+    if "prices" in options:
+        prices = options["prices"]
+        if not isinstance(prices, dict) or set(prices) - {"input", "output", "cache_input", "currency"}:
+            raise ConfigError("Invalid prices mapping")
+        if not {"input", "output", "currency"} <= set(prices):
+            raise ConfigError("prices requires input/output rates per million tokens and currency")
+        if not isinstance(prices["currency"], str) or not re.fullmatch(r"[A-Z]{3}", prices["currency"]):
+            raise ConfigError("prices.currency must be a three-letter currency code")
+        for key in ("input", "output", "cache_input"):
+            if key in prices and (type(prices[key]) not in (int, float) or prices[key] < 0):
+                raise ConfigError("Token prices must be finite nonnegative numbers")
     return options
 
 

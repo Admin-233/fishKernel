@@ -1,8 +1,4 @@
-"""单实例锁：同一个存档只允许一个内核进程。
-
-POSIX 用 flock，Windows 用 msvcrt.locking。两者都由操作系统在进程退出/崩溃时
-自动释放，因此不会留下"假占用"把存档永久锁死。
-"""
+"""单实例锁：通过平台后端使用 Linux flock，进程退出时由系统释放。"""
 
 from __future__ import annotations
 

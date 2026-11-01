@@ -9,7 +9,10 @@ v0.4.3 时两处仍停在 0.3.0，`fishkernel --version` 一直报旧版本。
 from __future__ import annotations
 
 import re
-import tomllib
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 from pathlib import Path
 
 import fishkernel

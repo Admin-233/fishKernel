@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import json
 import multiprocessing
+import os
 import select
 import sys
 import threading
@@ -68,14 +69,20 @@ class Plugin:
         require_runtime()
         context = multiprocessing.get_context("spawn")
         initialized = False
+        buffer = b""
         try:
             while True:
                 readable, _, _ = select.select([sys.stdin], [], [], 0.02)
                 if readable:
-                    line = sys.stdin.buffer.readline(512 * 1024 + 1)
-                    if not line:
+                    chunk = os.read(sys.stdin.fileno(), 65536)
+                    if not chunk:
                         return
-                    if len(line) > 512 * 1024 or not line.endswith(b"\n"):
+                    buffer += chunk
+                    if len(buffer) > 512 * 1024 and b"\n" not in buffer:
+                        raise ValueError("Invalid host frame")
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if len(line) >= 512 * 1024:
                         raise ValueError("Invalid host frame")
                     message = json.loads(line)
                     kind = message.get("type")

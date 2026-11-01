@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass
 
 from .archive import Archive, ArchiveError, render_history
-from .config import InstanceConfig
+from .config import InstanceConfig, ConfigError
 from .constants import SUMMARY_MAX_TOKENS_CAP
 from .events import Event, EventLog, read_events
-from .llm import LLMClient
-from .messages import conversation_units, project_units, message_units
+from .llm import LLMClient, LLMError
+from .messages import conversation_units, project_units, message_units, ProjectionError
 from .tokens import estimate_message, estimate_messages, estimate_text, estimate_tools
 
 SUMMARY_SYSTEM = """你是上下文压缩器。你的唯一任务是把给定的对话历史压缩成一份结构化的中文概要，
@@ -78,7 +79,15 @@ class Compressor:
         self.events = events
         self.logger = logger
         # 单次摘要请求最多占多大上下文；超过就分块摘要再合并。
-        self.chunk_limit = chunk_limit or max(1024, config.spec.context_window // 2)
+        self._chunk_limit = chunk_limit
+
+    @property
+    def chunk_limit(self):
+        return self._chunk_limit or max(1024, self.config.spec.context_window // 2)
+
+    def _project(self, units):
+        return project_units(units, reasoning_field=self.config.options.get("reasoning_field"),
+                             require_reasoning=self.config.options.get("require_reasoning", False))
 
     # ---- 观测 ----
     @property
@@ -119,7 +128,8 @@ class Compressor:
             return False
         committed_here = any(e.type == "compaction/summary" for e in events[last_start + 1:])
         self.events.append("compaction/end" if committed_here else "compaction/abort",
-                           ok=committed_here, reason="recovered", recovered=True)
+                           ok=committed_here, reason="recovered", recovered=True,
+                           transaction_id=events[last_start].data.get("transaction_id"))
         self._log("发现未闭合的压缩事务，已标记为 stale")
         return True
 
@@ -130,7 +140,7 @@ class Compressor:
         if len(units) <= 1:
             return CompactionOutcome(compacted=False, reason="nothing_to_compact")
 
-        unit_tokens = [estimate_messages(project_units([unit])) for unit in units]
+        unit_tokens = [estimate_messages(self._project([unit])) for unit in units]
         retain_budget = max(1, retain_override if retain_override is not None else self.retain)
 
         kept = 0
@@ -149,14 +159,16 @@ class Compressor:
             return CompactionOutcome(compacted=False, reason="nothing_to_compact")
 
         region_units = units[: len(units) - kept]
-        region_messages = project_units(region_units)
+        region_messages = self._project(region_units)
         region_tokens = estimate_messages(region_messages)
         region_events = [event for unit in region_units for event in unit]
         from_seq = region_events[0].seq
         to_seq = region_events[-1].seq
 
+        transaction_id = uuid.uuid4().hex
         self.events.append(
             "compaction/start",
+            transaction_id=transaction_id,
             trigger=trigger,
             threshold=self.threshold,
             region_tokens=region_tokens,
@@ -171,9 +183,10 @@ class Compressor:
         try:
             summary, usage = self._summarize(region_messages, region_tokens, summary_max_tokens)
             if summary is None:
-                self.events.append("compaction/abort", reason="摘要未缩短输入，重试后放弃")
+                self.events.append("compaction/abort", transaction_id=transaction_id, reason="摘要未缩短输入，重试后放弃")
                 return CompactionOutcome(compacted=False, reason="summary_not_shorter")
             return self._commit(
+                transaction_id=transaction_id,
                 summary=summary,
                 usage=usage,
                 region_events=region_events,
@@ -185,8 +198,10 @@ class Compressor:
         except (ArchiveError, OSError):
             raise
         except Exception as exc:  # Model failures leave the previous committed summary intact.
-            self.events.append("compaction/abort", reason=f"{type(exc).__name__}: {exc}"[:500])
+            self.events.append("compaction/abort", transaction_id=transaction_id, reason=f"{type(exc).__name__}: {exc}"[:500])
             self._log(f"压缩失败：{exc}")
+            if isinstance(exc, (ConfigError, ProjectionError)) or (isinstance(exc, LLMError) and not exc.retryable):
+                raise
             return CompactionOutcome(compacted=False, reason="error")
 
     def _summarize(self, region_messages: list[dict], region_tokens: int, max_tokens: int):
@@ -272,6 +287,7 @@ class Compressor:
     def _commit(
         self,
         *,
+        transaction_id: str,
         summary: str,
         usage: dict,
         region_events: list[Event],
@@ -298,6 +314,7 @@ class Compressor:
         freed = max(0, region_tokens - summary_tokens)
         self.events.append(
             "compaction/summary",
+            transaction_id=transaction_id,
             projection_version=1,
             summary=summary,
             from_seq=from_seq,
@@ -310,7 +327,7 @@ class Compressor:
             usage=usage,
         )
         self.archive.write_digest(summary)
-        self.events.append("compaction/end", ok=True)
+        self.events.append("compaction/end", ok=True, transaction_id=transaction_id)
         self.archive.rewrite_history(read_events(self.archive.events_path))
         self._log(f"压缩完成：seq {from_seq}..{to_seq} → 概要，释放约 {freed} tokens")
         return CompactionOutcome(

@@ -22,8 +22,11 @@ class CoordinatedClient:
                 time.sleep(0.05)
             completion = future.result()
         call_id = uuid.uuid4().hex
-        self.events.append("llm/usage", call_id=call_id, model=completion.model or self.config.model,
+        record = self.events.append("llm/usage", call_id=call_id, model=completion.model or self.config.model,
                            usage=completion.usage, prices=self.config.options.get("prices"),
-                           thinking=self.config.thinking, reasoning_effort=self.config.effort)
+                           thinking=self.config.thinking, reasoning_effort=self.config.effective_effort,
+                           config_revision=self.config.revision)
+        from .atomic import append_line
+        append_line(self.events.path.parent / "usage.jsonl", record.to_json())
         completion.usage_call_id = call_id
         return completion

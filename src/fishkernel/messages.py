@@ -216,10 +216,9 @@ def build_messages(events: list[Event], system_text: str, *, reasoning_field: st
         elif event.type == "delay":
             # 延时事件保留在事件流里供审计与 TUI 展示，但**不再投影进上下文**。
             # 原因：每轮一条「[runtime] 等待 N 秒」几乎不携带信息，
-            # 长期运行会把上下文撑爆（实测 200 多轮就从 13 万涨到 46 万 token）。
             pass
         elif event.type == "memory/write":
-            # 已登记、尚未落盘：压缩时会写进 LongTermMemory.txt
+            # 记忆已经提交；保留操作记录供对话追踪
             mode = event.data.get("mode", "append")
             content = str(event.data.get("content", "")).strip()
             tail.append(
@@ -292,10 +291,10 @@ def conversation_units(events: list[Event]) -> list[list[Event]]:
     return units
 
 
-def project_units(units: list[list[Event]]) -> list[dict[str, Any]]:
+def project_units(units: list[list[Event]], **options) -> list[dict[str, Any]]:
     """把若干单元投影成消息（不含 system），供摘要调用使用。"""
     events = [event for unit in units for event in unit]
-    return [message for message in build_messages(events, "") if message["role"] != "system"]
+    return [message for message in build_messages(events, "", **options) if message["role"] != "system"]
 
 
 def message_units(messages: list[dict]) -> list[list[dict]]:

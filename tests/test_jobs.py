@@ -60,9 +60,11 @@ def test_orphan_recovery(archive):
         encoding="utf-8",
     )
     manager = JobManager(archive)
+    before = (job_dir / "meta.json").read_bytes()
     notices = manager.recover()
-    assert len(notices) == 1
-    assert manager.load("proc-00000000beef").status == "failed"
+    assert notices == []
+    assert manager.load("proc-00000000beef").status == "historical"
+    assert (job_dir / "meta.json").read_bytes() == before
 
 
 def test_adopt_live_process(archive):
@@ -188,6 +190,7 @@ def test_timeout_still_fires_when_actually_expired(archive):
     meta = {
         "id": job_id, "command": "sleep 300", "cwd": str(archive.root),
         "label": "早就该超时", "status": "running", "pid": None, "exit_code": None,
+        "identity": "test-only-no-pid",
         "started_at": _time.strftime("%Y-%m-%dT%H:%M:%S%z", _time.localtime(_time.time() - 3600)),
         "ended_at": None, "timeout_seconds": 60.0, "adopted": False,
     }

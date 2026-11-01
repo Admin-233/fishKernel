@@ -7,15 +7,15 @@ import tempfile
 from pathlib import Path
 
 
-def write_atomic(path: Path | str, text: str) -> None:
+def write_atomic(path: Path | str, text: str | bytes) -> None:
     """原子写文本；失败时不破坏旧文件。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     tmp = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8") if isinstance(text, str) else text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)

@@ -119,24 +119,6 @@ def plan_trim(archive: Archive, events: list[Event] | None = None) -> TrimPlan:
     return TrimPlan(cutoff_seq=to_seq, archived=archived, kept=kept, summary_event=summary_event)
 
 
-def _ensure_no_kernel_running(archive: Archive) -> None:
-    """确认没有内核在跑，否则拒绝改写事件流。
-
-    apply_trim 用 write_atomic 整体替换 events.jsonl。如果内核同时在追加
-    事件，那些新事件会随着旧文件一起被覆盖 —— 实测并发写入 300 条时
-    永久丢失 7 条。所以必须先确保独占。
-    """
-    probe = InstanceLock(archive.lock_path)
-    try:
-        probe.acquire(timeout=0.0)
-    except LockError as exc:
-        raise TrimError(
-            "内核正在运行，不能 trim。先停内核（fishkernel ctl <存档> stop），"
-            "否则并发写入的事件会丢失。"
-        ) from exc
-    probe.release()
-
-
 def apply_trim(archive: Archive, plan: TrimPlan, *, stamp: str | None = None) -> Path | None:
     """执行归档：先把要挪走的事件写成归档文件，再原子替换 events.jsonl。"""
     lock = InstanceLock(archive.lock_path)
@@ -154,11 +136,20 @@ def apply_trim(archive: Archive, plan: TrimPlan, *, stamp: str | None = None) ->
 
 
 def _apply_locked(archive: Archive, plan: TrimPlan, *, stamp: str | None = None) -> Path | None:
+    from .usage import sync_usage
+    from .memory import MemoryStore
+    import uuid
+    MemoryStore(archive).recover(read_events(archive.events_path))
+    sync_usage(archive)
     if plan.empty:
         return None
 
-    stamp = stamp or time.strftime("%Y%m%d-%H%M%S")
+    stamp = stamp or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
+    if any(ch in stamp for ch in ('/', '\\', '"', '\n', '\r')):
+        raise TrimError("Invalid archive stamp")
     archive_path = archive.memory_dir / f"{ARCHIVE_PREFIX}{stamp}.jsonl"
+    if archive_path.exists():
+        raise TrimError("Archive destination already exists; refusing to overwrite history")
     header = (
         f'{{"_trim": true, "stamp": "{stamp}", "cutoff_seq": {plan.cutoff_seq}, '
         f'"archived_events": {len(plan.archived)}}}\n'

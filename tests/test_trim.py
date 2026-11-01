@@ -43,6 +43,17 @@ def _seed_with_compaction(log, *, turns: int = 4, tail: int = 3):
     return to_seq
 
 
+def test_existing_trim_archive_is_never_overwritten(archive, log):
+    _seed_with_compaction(log)
+    target = archive.memory_dir / f"{ARCHIVE_PREFIX}fixed.jsonl"
+    target.write_bytes(b"previous archived context")
+    before = archive.events_path.read_bytes()
+    with pytest.raises(TrimError, match="already exists"):
+        apply_trim(archive, plan_trim(archive), stamp="fixed")
+    assert target.read_bytes() == b"previous archived context"
+    assert archive.events_path.read_bytes() == before
+
+
 # ---------------------------------------------------------------- 正常路径
 
 

@@ -83,3 +83,48 @@ def test_nonfinite_configuration_rejected(value):
 def test_inline_comments_keep_fragments():
     values = parse_instance('max_tokens = 1024 # comment\napi_base = https://host/#fragment\nname = "a # b"')
     assert values == {"max_tokens": "1024", "api_base": "https://host/#fragment", "name": "a # b"}
+
+
+@pytest.mark.parametrize("options", [{"output_parameter":[]}, {"reasoning_field":{}},
+                                      {"prices":{"input":-1,"output":2,"currency":"USD"}},
+                                      {"prices":{"input":float("nan"),"output":2,"currency":"USD"}},
+                                      {"require_reasoning":True}])
+def test_invalid_model_options_are_configuration_errors(options):
+    from fishkernel.config import validate_options
+    with pytest.raises(ConfigError):
+        validate_options(options)
+
+
+def test_reasoning_counts_toward_context_budget():
+    from fishkernel.tokens import estimate_message
+    plain = {"role":"assistant", "content":"response"}
+    assert estimate_message({**plain, "reasoning_content":"reasoning " * 500}) > estimate_message(plain) + 1000
+
+
+def test_compression_preserves_configured_reasoning_and_transaction_id(archive, config, log):
+    from fishkernel.compress import Compressor
+    from fishkernel.llm import ScriptedClient, Completion
+    config.options = {"reasoning_field":"reasoning_content", "require_reasoning":True}
+    log.append("assistant/message", text="tool action", reasoning="full reasoning " * 100,
+               reasoning_complete=True, tool_calls=[{"id":"a","name":"list_dir","arguments":"{}"}])
+    log.append("tool/result", call_id="a", output="{}")
+    log.append("user/message", text="continue")
+    def summarize(messages):
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        assert assistant["reasoning_content"] == "full reasoning " * 100
+        return Completion(text="summary")
+    compressor = Compressor(archive, config, ScriptedClient([summarize]), log)
+    assert compressor.compact(retain_override=1).compacted
+    from fishkernel.events import read_events
+    transactions = [e.data["transaction_id"] for e in read_events(archive.events_path) if e.type.startswith("compaction/")]
+    assert len(transactions) == 3 and len(set(transactions)) == 1
+
+
+def test_compression_does_not_hide_nonretryable_api_failure(archive, config, log):
+    from fishkernel.compress import Compressor
+    from fishkernel.llm import ScriptedClient, LLMError
+    log.append("user/message", text="old context " * 100)
+    log.append("user/message", text="retain")
+    compressor = Compressor(archive, config, ScriptedClient([LLMError("bad config", retryable=False)]), log)
+    with pytest.raises(LLMError):
+        compressor.compact(retain_override=1)

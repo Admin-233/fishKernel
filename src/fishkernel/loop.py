@@ -17,7 +17,7 @@ from .constants import MAX_TOOL_CALLS_PER_TURN
 from .control import Control
 from .events import EventLog, read_events
 from .jobs import Job, JobManager
-from .llm import Completion, ContextOverflowError, LLMClient, OpenAIClient, LLMError
+from .llm import Completion, ContextOverflowError, LLMClient, OpenAIClient, LLMError, ScriptedClient
 from .coordinator import CoordinatedClient
 from .plugins import PluginManager
 from .archive import ArchiveError
@@ -74,7 +74,6 @@ class Kernel:
     ):
         self.archive = Archive(Path(archive_root).expanduser().resolve())
         self.archive.validate()
-        self.archive.ensure_runtime()
         self.config: InstanceConfig = load_config(self.archive.root)
         self.logger = Logger(self.archive.log_path, echo=echo)
         self.events = EventLog(self.archive.events_path)
@@ -95,6 +94,7 @@ class Kernel:
         self.client = CoordinatedClient(self._raw_client, self._service, self.events, self.config)
         self._config_stamp = self._config_signature()
         self._config_blocked = False
+        self._tool_generations = None
         if client is None:
             # 没有 Key 就在启动时报错，而不是每轮失败一次
             self.config.require_api_key()
@@ -111,15 +111,20 @@ class Kernel:
         require_runtime()
         self.lock.acquire(timeout=5.0)
         try:
+            self.archive.ensure_runtime()
             self.events.open()
-            from .memory import MemoryStore
-            MemoryStore(self.archive).recover(read_events(self.archive.events_path))
+            from .migration import prepare
+            from .usage import sync_usage
+            prepare(self.archive, self.events)
+            sync_usage(self.archive)
             return self._run_locked()
         finally:
-            self.plugins.close()
-            self.events.close()
-            self.lock.release()
-            self._restore_signals()
+            try:
+                self.plugins.close()
+            finally:
+                self.events.close()
+                self.lock.release()
+                self._restore_signals()
 
     def _run_locked(self) -> int:
         self._install_signals()
@@ -167,7 +172,8 @@ class Kernel:
                     reason = "signal"
                     break
                 if self.max_turns and self.turns >= self.max_turns:
-                    reason = "max_turns"
+                    reason = "config_blocked" if self._config_blocked else "max_turns"
+                    exit_code = 2 if self._config_blocked else 0
                     break
                 state = self.control.read_state()
                 if state["run"] == "stop":
@@ -199,24 +205,22 @@ class Kernel:
                     raise
                 except Exception as exc:  # noqa: BLE001 - 内核必须活下来
                     failures += 1
-                    fatal = _is_fatal(exc)
-                    if isinstance(exc, LLMError) and not exc.retryable:
+                    fatal = _is_fatal(exc) and not isinstance(exc, ConfigError)
+                    if isinstance(exc, ConfigError) or (isinstance(exc, LLMError) and not exc.retryable):
                         self._config_blocked = True
                     self.logger.error(traceback.format_exc(limit=8).strip())
                     self.events.append(
                         "error",
                         stage="turn",
                         message=f"{type(exc).__name__}: {exc}"[:1000],
-                        retryable=not fatal,
+                        retryable=not fatal and not self._config_blocked,
                         failures=failures,
                         fatal=fatal,
                     )
                     self._write_state("error")
 
                     if fatal:
-                        # 存档/配置类错误重试不会自愈（2026-10-27 实测：
-                        # ToolsRegister.txt 写坏后连续失败 40 次、卡了 10 分钟）。
-                        # 停下来让人看到问题，比假装还在工作更有价值。
+                        # 存储或投影错误需要修复后才能继续写入。
                         self.logger.error(
                             f"遇到不可恢复的错误，内核停止：{type(exc).__name__}: {exc}"
                         )
@@ -236,16 +240,13 @@ class Kernel:
             self.events.append(
                 "session/end", reason=reason, turns=self.turns, exit_code=exit_code
             )
-            self.events.close()
-            self.lock.release()
-            self._restore_signals()
             self.logger.info(f"内核退出：{reason}（共 {self.turns} 轮）")
         return exit_code
 
     def _handover(self, request: dict[str, object] | None = None) -> bool:
         """交班：先启动接班人，再释放锁，然后由调用方正常退出。"""
         try:
-            target = spawn_successor(self.archive)
+            target = spawn_successor(self.archive, extra_args=("--mock",) if isinstance(self._raw_client, ScriptedClient) else ())
         except Exception as exc:  # noqa: BLE001 - 交班失败不能让旧进程直接死掉
             self.logger.error(f"交班启动失败：{exc}")
             self.events.append("error", stage="handover", message=f"{type(exc).__name__}: {exc}"[:800], retryable=False)
@@ -271,6 +272,7 @@ class Kernel:
 
         system_text = self.archive.system_text()
         tools = self.toolbox.specs()
+        self._tool_generations = self.plugins.generations()
         events = read_events(self.archive.events_path)
         messages = self._messages(events, system_text)
         pressure = self.meter.pressure(events=events, messages=messages, system_text=system_text, tools=tools)
@@ -415,6 +417,8 @@ class Kernel:
             reasoning_complete=True,
             thinking=self.config.thinking,
             reasoning_effort=self.config.effort,
+            config_revision=self.config.revision,
+            tool_generations=self._tool_generations,
             tool_calls=calls,
             usage=completion.usage,
             usage_call_id=completion.usage_call_id,
@@ -431,6 +435,13 @@ class Kernel:
         calls = completion.tool_calls
         for call in calls[:MAX_TOOL_CALLS_PER_TURN]:
             self._service()
+            if (call.name.startswith("plugin_") and "__" in call.name and self._tool_generations is not None
+                    and (call.name not in self._tool_generations or
+                         self.plugins.generations().get(call.name) != self._tool_generations[call.name])):
+                self.events.append("tool/result", call_id=call.id, name=call.name, ok=False,
+                                   output=json.dumps({"ok": False, "error": {"code": "PLUGIN_CHANGED", "not_executed": True}}),
+                                   duration_ms=0)
+                continue
             if self.control.has_pending() or self._stop or self.control.read_state()["run"] != "run":
                 self.events.append("tool/result", call_id=call.id, name=call.name, ok=False,
                                    output=json.dumps({"ok": False, "error": {"code": "INTERRUPTED", "not_executed": True}}),
@@ -455,6 +466,7 @@ class Kernel:
                     "ok": False,
                     "error": {
                         "code": "TOOL_CALL_LIMIT",
+                        "not_executed": True,
                         "message": f"单轮最多执行 {MAX_TOOL_CALLS_PER_TURN} 个调用，这次没有执行。",
                     },
                 },
@@ -512,12 +524,14 @@ class Kernel:
             self.archive,
             {
                 "pid": os.getpid(),
+                "process_identity": __import__("fishkernel.platform", fromlist=["process_identity"]).process_identity(os.getpid()),
                 "name": self.config.name,
                 "model": self.config.model,
                 "status": status,
                 "turn": self.turns,
                 "thinking": self.config.thinking,
-                "reasoning_effort": self.config.effort,
+                "reasoning_effort": self.config.effective_effort,
+                "config_revision": self.config.revision,
                 "plugins": self.plugins.status(),
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             },

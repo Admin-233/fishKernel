@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -359,7 +360,7 @@ class ToolBox:
         data = path.read_bytes()
         b64 = base64.b64encode(data).decode("ascii")
         mime = "jpeg" if kind == "jpeg" else kind
-        # 用 data URL，DeepSeek 接受这种形式（实测通过）
+        # 图片使用 Chat Completions 的 data URL 内容块
         url = f"data:image/{mime};base64,{b64}"
         # 图片本体放在 __images__ 里，dispatch 会把它摘出来放进 ToolResult.images，
         # 不留在给模型看的 JSON 文本里（否则 base64 会污染上下文）。
@@ -426,7 +427,7 @@ class ToolBox:
         except OSError as exc:
             raise _ToolError("io_error", f"读取失败：{exc}") from None
         # 图片不是"读不了的二进制"，而是可以直接交给模型看的内容。
-        # deepseek-flash 的 input_modalities 含 image，内核只要把图片块传上去即可。
+        # 是否支持图片由模型能力配置决定。
         image_kind = _sniff_image(head)
         if image_kind is not None:
             return self._read_image(path, image_kind, head)
@@ -581,7 +582,7 @@ class ToolBox:
                 if job.status not in {"running", "stopping"}:
                     return {"job": job.to_dict(), "waited": True}
                 state = self.control.read_state()
-                if state["run"] == "stop":
+                if self.control.stop_requested() or state["run"] == "stop":
                     return {"job": job.to_dict(), "waited": False, "interrupted": "stop"}
                 if state["run"] == "pause":
                     return {"job": job.to_dict(), "waited": False, "interrupted": "pause"}
@@ -642,11 +643,13 @@ def _as_int(value: Any, default: int, *, minimum: int | None = None, maximum: in
     elif isinstance(value, bool):
         result = int(value)
     elif isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise _ToolError("invalid_arguments", "需要有限数字")
         result = int(value)
     elif isinstance(value, str) and value.strip():
         try:
             result = int(float(value.strip()))
-        except ValueError:
+        except (ValueError, OverflowError):
             raise _ToolError("invalid_arguments", f"需要整数，收到 {value!r}") from None
     else:
         result = default
@@ -669,6 +672,8 @@ def _as_float(value: Any, default: float, *, minimum: float | None = None, maxim
             raise _ToolError("invalid_arguments", f"需要数字，收到 {value!r}") from None
     else:
         result = default
+    if not math.isfinite(result):
+        raise _ToolError("invalid_arguments", "需要有限数字")
     if minimum is not None:
         result = max(minimum, result)
     if maximum is not None:

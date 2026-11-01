@@ -14,12 +14,38 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from .lock import LockError
 from .atomic import write_atomic
-from .platform import require_runtime, process_identity, terminate_group
+from .platform import require_runtime, process_identity, process_alive, terminate_group
 
 MAX_FRAME = 512 * 1024
+MAX_QUEUE_BYTES = 4 * 1024 * 1024
 ID = re.compile(r"^[a-z][a-z0-9_]{0,23}$")
 NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,23}$")
+
+
+def _reject_constant(value):
+    raise ValueError("Nonfinite JSON number")
+
+
+def read_status(archive):
+    try:
+        value = json.loads((archive.runtime_dir / "plugins" / "status.json").read_text(encoding="utf-8"))
+        return value if isinstance(value, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def read_config(root, plugin_id):
+    path = root / "Plugins" / plugin_id / "config.json"
+    if not path.exists():
+        return {}
+    if path.stat().st_size > 256 * 1024:
+        raise ValueError("Plugin config too large")
+    value = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_constant)
+    if not isinstance(value, dict):
+        raise ValueError("Plugin config must be an object")
+    return value
 
 
 class PluginError(Exception):
@@ -28,10 +54,30 @@ class PluginError(Exception):
         self.code = code
 
 
+class FrameQueue(queue.Queue):
+    """Bound both message count and payload bytes across producer/owner threads."""
+    def __init__(self):
+        super().__init__(maxsize=256)
+        self.bytes = 0
+
+    def _put(self, item):
+        size = len(item) if isinstance(item, bytes) else len(json.dumps(item, ensure_ascii=False).encode())
+        if self.bytes + size > MAX_QUEUE_BYTES:
+            raise queue.Full
+        self.bytes += size
+        super()._put((item, size))
+
+    def _get(self):
+        item, size = super()._get()
+        self.bytes -= size
+        return item
+
+
 def _local_schema(value):
     if isinstance(value, dict):
-        if "$ref" in value and not str(value["$ref"]).startswith("#"):
-            raise ValueError("Only local JSON Schema references are allowed")
+        for key in ("$ref", "$dynamicRef", "$recursiveRef"):
+            if key in value and not str(value[key]).startswith("#"):
+                raise ValueError("Only local JSON Schema references are allowed")
         for child in value.values():
             _local_schema(child)
     elif isinstance(value, list):
@@ -40,7 +86,7 @@ def _local_schema(value):
 
 
 def manifest(root: Path, plugin_id: str) -> dict:
-    if not ID.fullmatch(plugin_id):
+    if not isinstance(plugin_id, str) or not ID.fullmatch(plugin_id):
         raise ValueError("Plugin ID must match [a-z][a-z0-9_]{0,23}")
     directory = root / "Plugins" / plugin_id
     path = directory / "plugin.json"
@@ -67,7 +113,12 @@ def manifest(root: Path, plugin_id: str) -> dict:
         seen.add(tool["name"])
         schema = tool.get("parameters", {"type": "object"})
         _local_schema(schema)
-        Draft202012Validator.check_schema(schema)
+        try:
+            Draft202012Validator.check_schema(schema)
+        except Exception as exc:
+            raise ValueError("Invalid tool JSON Schema") from exc
+        if not isinstance(schema, dict):
+            raise ValueError("Tool parameters must describe an object")
         if schema.get("type") != "object":
             raise ValueError("Tool parameters must describe an object")
         if not isinstance(tool.get("description", ""), str):
@@ -81,8 +132,8 @@ class PluginProcess:
         self.id = definition["id"]
         self.generation = uuid.uuid4().hex
         self.root = root
-        self.incoming = queue.Queue(maxsize=256)
-        self.outgoing = queue.Queue(maxsize=256)
+        self.incoming = FrameQueue()
+        self.outgoing = FrameQueue()
         self.process = None
         self.identity = None
         self.fault = None
@@ -95,21 +146,18 @@ class PluginProcess:
         self.subscriptions = set()
         self.cursor = 0
         self.config = {}
+        self.last_error = None
+        self.health = None
+        self.ready_since = None
 
     def start(self):
         require_runtime()
         directory = self.root / "Plugins" / self.id
-        config = directory / "config.json"
-        if config.exists():
-            if config.stat().st_size > 256 * 1024:
-                raise ValueError("Plugin config too large")
-            self.config = json.loads(config.read_text(encoding="utf-8"))
-            if not isinstance(self.config, dict):
-                raise ValueError("Plugin config must be an object")
+        self.config = read_config(self.root, self.id)
         command = [sys.executable if x == "{python}" else x for x in self.definition["command"]]
         self.process = subprocess.Popen(command, cwd=directory, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-        self.identity = process_identity(self.process.pid)
+        self.identity = process_identity(self.process.pid, include_zombie=True)
         for stream, kind in ((self.process.stdout, "message"), (self.process.stderr, "stderr")):
             threading.Thread(target=self._read, args=(stream, kind), daemon=True).start()
         threading.Thread(target=self._write, daemon=True).start()
@@ -124,9 +172,9 @@ class PluginProcess:
                         return
                     if len(line) > MAX_FRAME or not line.endswith(b"\n"):
                         raise ValueError("oversized or unfinished frame")
-                    value = json.loads(line) if kind == "message" else line.decode("utf-8", "replace")
+                    value = json.loads(line, parse_constant=_reject_constant) if kind == "message" else line.decode("utf-8", "replace")
                     self.incoming.put_nowait((kind, value))
-        except (ValueError, OSError, queue.Full) as exc:
+        except (ValueError, OSError, queue.Full, RecursionError) as exc:
             if not self.closed:
                 self.fault = f"{type(exc).__name__}: invalid or excessive plugin output"
 
@@ -159,11 +207,11 @@ class PluginProcess:
         except queue.Full:
             pass
         if self.process is not None:
-            if self.process.poll() is None:
-                if self.identity:
-                    terminate_group(self.process.pid, self.identity)
-                else:
-                    self.process.kill()
+            if self.identity:
+                # Kill the group before reaping a dead leader, so its children cannot leak.
+                terminate_group(self.process.pid, self.identity)
+            elif self.process.poll() is None:
+                self.process.kill()
             try:
                 self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -242,6 +290,7 @@ class PluginManager:
     def _failed(self, plugin_id, code, detail):
         plugin = self.instances.get(plugin_id)
         if plugin:
+            plugin.last_error = {"code": code, "message": self._redact(plugin_id, str(detail))}
             plugin.stop()
         count = self.failures.get(plugin_id, 0) + 1
         self.failures[plugin_id] = count
@@ -254,9 +303,13 @@ class PluginManager:
 
     def status(self):
         return [{"id": key, "enabled": key in self.enabled,
-                 "state": ("ready" if self.instances.get(key) and self.instances[key].ready else
+                 "state": ("disabled" if key not in self.enabled else "ready" if self.instances.get(key) and self.instances[key].ready else
                            "isolated" if self.failures.get(key, 0) >= 3 else "starting" if key in self.enabled else "disabled"),
                  "failures": self.failures.get(key, 0),
+                 "version": self.instances[key].definition.get("version", "unspecified") if key in self.instances else None,
+                 "last_error": self.instances[key].last_error if key in self.instances else None,
+                 "health": self.instances[key].health if key in self.instances else None,
+                 "exit_code": self.instances[key].process.returncode if key in self.instances and self.instances[key].process else None,
                  "generation": self.instances[key].generation if key in self.instances else None}
                 for key in sorted(self.enabled | set(self.instances))]
 
@@ -284,8 +337,8 @@ class PluginManager:
                             self._message(plugin, value)
                     if plugin.fault:
                         raise PluginError("PROTOCOL", plugin.fault)
-                    if plugin.process.poll() is not None:
-                        raise PluginError("EXITED", f"exit code {plugin.process.returncode}")
+                    if not process_alive(plugin.process.pid, plugin.identity):
+                        raise PluginError("EXITED", "Plugin process exited; exit code is recorded in status")
                     if now - plugin.last_seen > (20 if plugin.ready else 5):
                         raise PluginError("HEARTBEAT_TIMEOUT", "Plugin stopped responding")
                     if now - plugin.last_ping >= 5:
@@ -293,6 +346,9 @@ class PluginManager:
                         plugin.last_ping = now
                     if plugin.ready and plugin.subscriptions:
                         self._publish(plugin)
+                    if plugin.ready_since is not None and now - plugin.ready_since > 60 and self.failures.get(key, 0):
+                        self.failures[key] = 0
+                        self._save_status()
                 except Exception as exc:
                     self._failed(key, getattr(exc, "code", "PLUGIN_ERROR"), str(exc))
         finally:
@@ -314,6 +370,7 @@ class PluginManager:
             if message.get("protocol") != 1 or message.get("generation") != plugin.generation:
                 raise ValueError("Handshake mismatch")
             plugin.ready = True
+            plugin.ready_since = time.monotonic()
             self._save_status()
         elif kind == "pong":
             pass
@@ -321,7 +378,7 @@ class PluginManager:
             raise ValueError("Message before ready")
         elif kind == "result":
             identity = message.get("id")
-            if identity in plugin.expected:
+            if identity in plugin.expected and identity not in plugin.responses:
                 plugin.responses[identity] = message
             else:
                 self.events.append("plugin/late_result", plugin_id=plugin.id, request_id=str(identity)[:100])
@@ -333,9 +390,18 @@ class PluginManager:
                 identity = self.control.push_message(message.get("text"), source="plugin:" + plugin.id,
                                                      external_id=external, metadata=message.get("metadata"))
                 reply = {"type": "ack", "id": message.get("id"), "input_id": identity, "ok": True}
-            except (ValueError, OSError) as exc:
+            except (ValueError, OSError, LockError) as exc:
                 reply = {"type": "ack", "id": message.get("id"), "ok": False, "error": type(exc).__name__}
             plugin.send(reply)
+        elif kind == "log":
+            if message.get("level", "info") not in {"debug", "info", "warning", "error"} or not isinstance(message.get("message"), str):
+                raise ValueError("Invalid log message")
+            self._stderr(plugin.id, message.get("level", "info") + ": " + message["message"])
+        elif kind == "health":
+            if not isinstance(message.get("status"), str) or len(message["status"]) > 200:
+                raise ValueError("Invalid health status")
+            plugin.health = self._redact(plugin.id, message["status"])
+            self._save_status()
         elif kind == "subscribe":
             types = message.get("events", [])
             cursor = message.get("after_seq", 0)
@@ -367,6 +433,11 @@ class PluginManager:
                     "parameters": tool.get("parameters", {"type": "object"})}})
         return result
 
+    def generations(self):
+        return {f"plugin_{key}__{tool['name']}": plugin.generation
+                for key, plugin in self.instances.items() if key in self.enabled and plugin.ready
+                for tool in plugin.definition.get("tools", [])}
+
     def manage(self, action, plugin_id=None):
         if action == "list":
             return {"plugins": self.status()}
@@ -375,6 +446,8 @@ class PluginManager:
         if not isinstance(plugin_id, str) or not ID.fullmatch(plugin_id):
             raise ValueError("Invalid plugin ID")
         definition = None if action == "disable" else manifest(self.archive.root, plugin_id)
+        if action != "disable":
+            read_config(self.archive.root, plugin_id)  # Validate before stopping a healthy instance.
         if action in {"inspect", "validate"}:
             return {"manifest": definition, "valid": True}
         previous = self.instances.get(plugin_id)
@@ -397,6 +470,11 @@ class PluginManager:
                 self.service()
                 time.sleep(0.02)
             if not plugin or not plugin.ready:
+                self.enabled.discard(plugin_id)
+                if plugin:
+                    plugin.stop()
+                write_atomic(self.registry_path, json.dumps(sorted(self.enabled)))
+                self._save_status()
                 raise PluginError("NOT_READY", "Plugin failed to become ready; inspect logs/status")
         self._save_status()
         return {"plugins": self.status()}
@@ -415,10 +493,10 @@ class PluginManager:
         Draft202012Validator(tool.get("parameters", {"type": "object"})).validate(args)
         identity = uuid.uuid4().hex
         plugin.expected.add(identity)
-        plugin.send({"type": "call", "id": identity, "name": tool_name, "arguments": args})
         deadline = time.monotonic() + plugin.definition.get("timeout", 30)
         cancelled = False
         try:
+            plugin.send({"type": "call", "id": identity, "name": tool_name, "arguments": args})
             while True:
                 self.service()
                 if identity in plugin.responses:
@@ -444,4 +522,7 @@ class PluginManager:
 
     def close(self):
         for plugin in self.instances.values():
-            plugin.stop()
+            try:
+                plugin.stop()
+            except Exception as exc:
+                self._notice(plugin.id, "STOP_FAILED", str(exc))

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,9 +77,13 @@ def truncate_partial_tail(path: Path) -> bool:
             idx = block.rfind(b"\n")
             if idx != -1:
                 handle.truncate(start + idx + 1)
+                handle.flush()
+                os.fsync(handle.fileno())
                 return True
             pos = start
         handle.truncate(0)
+        handle.flush()
+        os.fsync(handle.fileno())
         return True
 
 
@@ -94,6 +99,7 @@ class EventLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
         if truncate_partial_tail(self.path):
+            warnings.warn(f"Repaired incomplete event tail: {self.path}", RuntimeWarning)
             # 末行被截断，缓存里的偏移已不可信
             clear_parse_cache(self.path)
         last = _last_seq(self.path)
@@ -166,6 +172,8 @@ def _last_seq(path: Path) -> int:
             event = Event.from_json(tail.strip().decode("utf-8", errors="replace"))
             if event is not None:
                 return event.seq
+        if position > 0:
+            raise ValueError("Cannot establish event sequence within scan limit; refusing to reset seq")
     return 0
 
 
@@ -217,6 +225,10 @@ def read_events(path: Path | str, after_seq: int = 0) -> list[Event]:
     if size > offset:
         new_events = list(cached_events)
         with open(path, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if opened.st_ino != ino or opened.st_size < offset:
+                offset, new_events = 0, []
+            ino, mtime = opened.st_ino, opened.st_mtime_ns
             if offset:
                 handle.seek(offset)
             new_offset = offset
@@ -229,14 +241,10 @@ def read_events(path: Path | str, after_seq: int = 0) -> list[Event]:
                     continue
                 event = Event.from_json(line)
                 if event is None:
+                    warnings.warn(f"Invalid complete event record at byte {new_offset - len(raw)} in {path}", RuntimeWarning)
                     continue
                 new_events.append(event)
         # 用解析到的新位置 + 当时的 mtime 作为下次的基线
-        try:
-            after = path.stat()
-            ino, mtime = after.st_ino, after.st_mtime_ns
-        except OSError:
-            pass
         _PARSE_CACHE[key] = (new_offset, ino, mtime, new_events)
         cached_events = new_events
 

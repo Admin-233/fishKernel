@@ -51,6 +51,15 @@ def test_message_queue_is_bounded(archive):
         process.send({"type": "ping"})
 
 
+def test_message_queue_is_also_bounded_by_bytes(archive):
+    _, raw = definition(archive)
+    process = PluginProcess(archive.root, raw)
+    for _ in range(8):
+        process.send({"type":"data", "body":"x" * 500000})
+    with pytest.raises(PluginError, match="consuming"):
+        process.send({"type":"data", "body":"x" * 500000})
+
+
 def test_plugin_error_is_visible_and_rate_limited(archive, log):
     host = manager(archive, log)
     host._failed("test", "CRASH", "failed")
@@ -89,6 +98,22 @@ def test_pending_input_interrupts_all_unexecuted_tools(archive):
     assert [e.data["call_id"] for e in results] == ["a", "b"]
     assert all(json.loads(e.data["output"])["error"]["not_executed"] for e in results)
     assert not list(archive.jobs_dir.glob("*/meta.json"))
+
+
+def test_old_generation_call_is_not_dispatched_to_replacement(archive, monkeypatch):
+    kernel = Kernel(archive.root, client=SimpleNamespace(), echo=False)
+    kernel.events.open()
+    kernel._tool_generations = {"plugin_test__echo":"old"}
+    monkeypatch.setattr(kernel.plugins, "generations", lambda: {"plugin_test__echo":"new"})
+    def forbidden(*args, **kwargs):
+        raise AssertionError("stale call was dispatched")
+    monkeypatch.setattr(kernel.toolbox, "dispatch", forbidden)
+    try:
+        kernel._run_tool_calls(Completion(tool_calls=[ToolCall("call", "plugin_test__echo", "{}")]))
+        event = read_events(archive.events_path)[-1]
+        assert json.loads(event.data["output"])["error"] == {"code":"PLUGIN_CHANGED", "not_executed":True}
+    finally:
+        kernel.events.close()
 
 
 LINUX = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux process backend")

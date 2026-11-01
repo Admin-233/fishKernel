@@ -15,7 +15,7 @@ DEFAULT_AGENT_PROMPT = """你是「{name}」，一个在这台机器上长期自
 ## 你的环境
 - 存档目录（也是你的家目录）：{root}
 - 你的记忆在 Memory/：Agent.txt（本条设定）、LongTermMemory.txt（长期记忆）、Digest.txt（压缩后的历史概要）
-- Tools/ToolsRegister.txt 登记了你可以使用的命令行工具，它们的用法在各自目录的 Usage.txt
+- 扩展放在 Plugins/<id>/，通过 plugin_manage 校验、启用和重载；当前请求的工具 schema 是可用工具清单
 - 你拥有这台机器的全部权限：可以读任何文件、执行任何命令
 
 ## 你如何行动
@@ -28,12 +28,6 @@ DEFAULT_AGENT_PROMPT = """你是「{name}」，一个在这台机器上长期自
 内核会无限循环：每轮把你的回复解析成工具调用并执行，然后唤醒你继续。没有工具调用的轮次会先延时再唤醒。
 不要原地空转：每一轮要么推进目标，要么用 `sleep` 明确等待，要么向用户说明你在等什么。
 """
-
-DEFAULT_TOOLS_REGISTER = """# 每行一个已启用的工具目录名；# 起始为注释。
-# 例如：
-# net-tools
-"""
-
 
 class ArchiveError(Exception):
     """存档缺失或损坏。"""
@@ -144,7 +138,6 @@ class Archive:
             raise ArchiveError(f"不是有效的存档：缺少 {self.config_path.name}")
         if not self.agent_path.is_file():
             # 允许缺失，但要有目录
-            self.memory_dir.mkdir(parents=True, exist_ok=True)
             if not self.agent_path.exists():
                 raise ArchiveError(f"存档缺少 {self.agent_path}")
 
@@ -156,30 +149,6 @@ class Archive:
             return ""
         except OSError as exc:
             raise ArchiveError(f"读取 {path} 失败：{exc}") from exc
-
-    def registered_tools(self) -> list[str]:
-        raw = self.read_text(self.register_path)
-        names: list[str] = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "/" in line or "\\" in line:
-                raise ArchiveError(f"ToolsRegister.txt 里的名字不能带路径分隔符：{line!r}")
-            if line not in names:
-                names.append(line)
-        return names
-
-    def tool_docs(self) -> str:
-        """已登记工具的 Usage.txt，带标题拼接。"""
-        blocks: list[str] = []
-        for index, name in enumerate(self.registered_tools(), start=1):
-            usage = self.tools_dir / name / "Usage.txt"
-            if not usage.is_file():
-                blocks.append(f"## 工具 {index}：{name}\n（缺少 Usage.txt）")
-                continue
-            blocks.append(f"## 工具 {index}：{name}\n{usage.read_text(encoding='utf-8').strip()}")
-        return "\n\n".join(blocks)
 
     def system_text(self) -> str:
         parts = [self.read_text(self.agent_path).strip()]
@@ -262,8 +231,10 @@ def create_archive(
     root = Path(root).expanduser().resolve()
     if root.exists() and any(root.iterdir()):
         raise ArchiveError(f"目标目录非空，拒绝覆盖：{root}")
+    from .config import config_from_values
+    config_from_values({"name": name, "model": model, "max_tokens": str(max_tokens), "turn_delay": str(turn_delay)})
     archive = Archive(root=root)
-    for path in (archive.memory_dir, archive.tools_dir, archive.runtime_dir):
+    for path in (archive.memory_dir, archive.runtime_dir):
         path.mkdir(parents=True, exist_ok=True)
     archive.ensure_runtime()
 
@@ -280,17 +251,12 @@ def create_archive(
     write_atomic(archive.agent_path, DEFAULT_AGENT_PROMPT.format(name=name, root=str(root)))
     write_atomic(archive.long_term_memory_path, "")
     write_atomic(archive.digest_path, "")
-    write_atomic(archive.register_path, DEFAULT_TOOLS_REGISTER)
     write_atomic(archive.history_path, "")
     write_atomic(archive.events_path, "")
 
-    # 给个示例工具目录，示范 Usage.txt 格式
-    example = archive.tools_dir / "shell"
-    example.mkdir(parents=True, exist_ok=True)
-    write_atomic(
-        example / "Usage.txt",
-        "名称：shell\n用途：执行任意 shell 命令。\n用法：spawn(command=\"你的命令\")；用 job_output(job_id) 取结果。\n",
-    )
+    write_atomic(archive.runtime_dir / "format.json", json.dumps({"version": 2}))
+    (archive.root / "Plugins").mkdir(exist_ok=True)
+    write_atomic(archive.root / "Plugins" / "enabled.json", "[]")
     return archive
 
 

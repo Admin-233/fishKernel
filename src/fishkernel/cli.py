@@ -84,6 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_plugin.add_argument("directory")
     p_plugin.add_argument("action", choices=["list", "inspect", "validate", "enable", "disable", "restart", "reload"])
     p_plugin.add_argument("id", nargs="?")
+    p_migrate = sub.add_parser("migrate", help="只读检查旧档，或迁移到新副本")
+    p_migrate.add_argument("directory")
+    p_migrate.add_argument("--output", type=Path)
     return parser
 
 
@@ -91,6 +94,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "migrate":
+            from .migration import inspect, migrate_copy
+            archive = Archive(Path(args.directory).expanduser().resolve())
+            report = migrate_copy(archive, args.output) if args.output else inspect(archive)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
         if args.command == "plugin":
             return _cmd_plugin(args)
         if args.command == "new":
@@ -123,10 +132,11 @@ def _cmd_cost(args) -> int:
     import json as _json
 
     from .events import read_events
-    from .tokens import PRICE_CACHE_HIT, PRICE_CACHE_MISS, PRICE_OUTPUT, fold_usage
+    from .tokens import fold_usage
+    from .usage import usage_events
 
     archive = _open_archive(args.directory)
-    totals = fold_usage(read_events(archive.events_path))
+    totals = fold_usage(usage_events(archive))
 
     if totals.calls == 0:
         print("还没有任何模型调用记录")
@@ -142,7 +152,8 @@ def _cmd_cost(args) -> int:
             "reasoning_tokens": totals.reasoning_tokens,
             "calls_without_cache_data": totals.calls_without_cache_data,
             "cache_hit_rate": round(totals.cache_hit_rate, 4),
-            "cost_yuan": round(totals.cost_yuan, 2),
+            "cost_yuan": round(totals.cost_yuan, 2) if totals.cost_yuan is not None else None,
+            "cost_text": totals.cost_text(),
         }, ensure_ascii=False, indent=2))
         return 0
 
@@ -159,8 +170,7 @@ def _cmd_cost(args) -> int:
     if totals.reasoning_tokens:
         print(f"    其中推理    {totals.reasoning_tokens:,}")
     print()
-    print(f"  估算花费      ¥{totals.cost_yuan:,.2f}")
-    print(f"  （单价：命中 ¥{PRICE_CACHE_HIT}/M，未命中 ¥{PRICE_CACHE_MISS}/M，输出 ¥{PRICE_OUTPUT}/M）")
+    print("  " + totals.cost_text())
     return 0
 
 
@@ -391,16 +401,15 @@ def _usage_totals(events) -> tuple[int, int, int, int | None]:
     return calls, prompt_total, completion_total, last_prompt
 
 
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
-
-
 def _cmd_plugin(args):
-    from .plugins import manifest
+    from .plugins import manifest, read_config, ID
     from .atomic import write_atomic
     import uuid
     archive = _open_archive(args.directory)
+    if args.action != "list" and (not isinstance(args.id, str) or not ID.fullmatch(args.id)):
+        raise ValueError("需要合法的插件 ID")
     if args.action in {"inspect", "validate"}:
+        read_config(archive.root, args.id)
         print(json.dumps(manifest(archive.root, args.id), ensure_ascii=False, indent=2))
     elif args.action == "list":
         path = archive.runtime_dir / "plugins" / "status.json"
@@ -410,6 +419,7 @@ def _cmd_plugin(args):
         require_runtime()
         if args.action != "disable":
             manifest(archive.root, args.id)
+            read_config(archive.root, args.id)
         identity = uuid.uuid4().hex + ".json"
         directory = archive.control_dir / "commands"
         if directory.exists() and len(list(directory.glob("*.json"))) >= 128:

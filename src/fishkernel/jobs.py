@@ -1,8 +1,8 @@
 """异步进程任务：id、输出文件、状态、等待与终止。
 
 设计要点：
-- stdout/stderr 直接写文件，不经过管道（否则管道写满会卡死子进程）。
-- 任务元数据原子写；内核重启后按 pid 接管，不会留下"幽灵任务"。
+- 独立任务监督进程捕获 stdout/stderr 并写有界文件，不依赖内核读取线程。
+- 任务元数据原子写；重启后验证启动身份再接管，不单凭 PID 操作。
 - 杀进程用进程组（POSIX），保证 shell 派生的孙进程一起结束。
 """
 
@@ -14,8 +14,9 @@ import signal
 import subprocess
 import time
 import uuid
-import threading
+import sys
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,8 @@ from pathlib import Path
 from .archive import Archive
 from .atomic import write_atomic
 from .constants import JOBS_KEEP_DIRS
+
+OUTPUT_LIMIT = 16 * 1024 * 1024
 from .platform import require_runtime, process_identity, process_alive, terminate_group
 
 
@@ -63,6 +66,7 @@ class Job:
     timeout_seconds: float = 0.0
     adopted: bool = False
     identity: str | None = None
+    started_monotonic: float | None = field(default_factory=time.monotonic)
 
     def to_dict(self) -> dict:
         return {
@@ -78,6 +82,7 @@ class Job:
             "timeout_seconds": self.timeout_seconds,
             "adopted": self.adopted,
             "identity": self.identity,
+            "started_monotonic": self.started_monotonic,
         }
 
     @classmethod
@@ -95,6 +100,7 @@ class Job:
             timeout_seconds=float(raw.get("timeout_seconds") or 0.0),
             adopted=bool(raw.get("adopted")),
             identity=raw.get("identity"),
+            started_monotonic=raw.get("started_monotonic"),
         )
 
 
@@ -103,7 +109,6 @@ class JobManager:
         self.archive = archive
         self._procs: dict[str, subprocess.Popen] = {}
         self._notices: list[Job] = []
-        self._overflow: set[str] = set()
         self._last_cleanup = 0.0
 
     # ---- 路径 ----
@@ -152,17 +157,14 @@ class JobManager:
             label=label,
             timeout_seconds=max(0.0, float(timeout_seconds or 0.0)),
         )
-        popen_kwargs: dict = {
-            "shell": True,
-            "cwd": str(workdir),
-            "stdin": subprocess.DEVNULL,
-        }
-        popen_kwargs["start_new_session"] = True
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kwargs)
+        with out_path.open("wb") as out, err_path.open("wb") as err:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "fishkernel.job_runner", str(job_dir / "exit-code"), command],
+                cwd=str(workdir), stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                start_new_session=True,
+            )
         job.pid = process.pid
         job.identity = process_identity(process.pid)
-        for pipe, path in ((process.stdout, out_path), (process.stderr, err_path)):
-            threading.Thread(target=self._capture, args=(job_id, pipe, path), daemon=True).start()
         self._procs[job_id] = process
         self._write_meta(job)
         return job
@@ -205,12 +207,10 @@ class JobManager:
                 self._write_meta(job)
                 continue
             job.adopted = True
-            job.status = "failed"
-            job.exit_code = None
-            job.ended_at = _now()
-            self._write_meta(job)
+            self._settle_adopted(job)
             notices.append(job)
         self._cleanup_old_jobs()
+        self._notices.clear()
         return notices
 
     def tick(self) -> list[Job]:
@@ -223,22 +223,23 @@ class JobManager:
             process = self._procs.get(job.id)
             exit_code = process.poll() if process is not None else None
             if process is None and job.pid and not process_alive(job.pid, job.identity):
-                self._settle(job, "failed", None)
+                self._settle_adopted(job)
                 settled.append(job)
                 continue
             if exit_code is not None:
-                status = "completed" if exit_code == 0 else "failed"
+                status = "output_limit" if self._output_limited(job) else ("completed" if exit_code == 0 else "failed")
                 self._settle(job, status, exit_code)
                 settled.append(job)
                 continue
-            if job.id in self._overflow:
+            if self._output_limited(job):
                 self._terminate(job)
                 self._settle(job, "output_limit", None)
                 continue
             if job.timeout_seconds > 0:
                 started = _started_timestamp(job.started_at)
                 # 时间戳解析不出来时不敢猜：宁可让任务继续跑，也不要误杀。
-                if started is not None and now - started > job.timeout_seconds:
+                elapsed = time.monotonic() - job.started_monotonic if job.started_monotonic is not None else (now - started if started is not None else 0)
+                if elapsed > job.timeout_seconds:
                     self._terminate(job)
                     self._settle(job, "timeout", None)
                     settled.append(job)
@@ -261,13 +262,13 @@ class JobManager:
                 except subprocess.TimeoutExpired:
                     exit_code = None
                 if exit_code is not None:
-                    status = "completed" if exit_code == 0 else "failed"
+                    status = "output_limit" if self._output_limited(job) else ("completed" if exit_code == 0 else "failed")
                     self._settle(job, status, exit_code)
                     return self.load(job_id)
             else:
                 time.sleep(0.1)
                 if job.pid and not process_alive(job.pid, job.identity):
-                    self._settle(job, "failed", None)
+                    self._settle_adopted(job)
                     return self.load(job_id)
             if time.monotonic() >= deadline:
                 return self.load(job_id)
@@ -338,29 +339,26 @@ class JobManager:
     def _alive(pid: int) -> bool:
         return process_alive(pid)
 
-    def _capture(self, job_id, pipe, path):
-        remaining = 16 * 1024 * 1024
+    def _output_limited(self, job):
+        return (self.job_dir(job.id) / "output-limit").exists()
+
+    def _settle_adopted(self, job):
         try:
-            with pipe, path.open("wb") as handle:
-                while True:
-                    block = pipe.read1(8192)
-                    if not block:
-                        break
-                    accepted = block[:remaining]
-                    handle.write(accepted)
-                    handle.flush()
-                    remaining -= len(accepted)
-                    if len(accepted) < len(block):
-                        self._overflow.add(job_id)
-        except OSError:
-            self._overflow.add(job_id)
+            code = int((self.job_dir(job.id) / "exit-code").read_text())
+        except (OSError, ValueError):
+            code = None
+        status = "output_limit" if self._output_limited(job) else ("completed" if code == 0 else "failed")
+        self._settle(job, status, code)
 
     def _cleanup_old_jobs(self) -> None:
         if not self.archive.jobs_dir.is_dir():
             return
+        from .events import read_events
+        referenced = {match for event in read_events(self.archive.events_path)
+                      for match in re.findall(r"proc-[a-zA-Z0-9_-]+", json.dumps(event.data))}
         entries = sorted(
             (self.job_dir(job.id) for job in self.list()
-             if job.status not in {"running", "stopping", "historical"}),
+             if job.status not in {"running", "stopping", "historical"} and job.id not in referenced),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )

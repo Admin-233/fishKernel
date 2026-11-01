@@ -152,9 +152,10 @@ class OpenAIClient:
                     error = LLMError(f"服务端错误：{text}", code="SERVER", retryable=True)
                 else:
                     raise LLMError(f"API 错误：{text}", code="API_ERROR", retryable=False) from exc
-            except Exception as exc:  # noqa: BLE001 - SDK 异常种类多，兜底成可重试
-                last_error = exc
-                error = LLMError(f"未知错误：{exc}", code="UNKNOWN")
+            except LLMError:
+                raise
+            except Exception as exc:  # Malformed responses/unsupported SDK parameters need inspection.
+                raise LLMError(f"客户端错误：{exc}", code="CLIENT_ERROR", retryable=False) from exc
 
             if not error.retryable or attempt == LLM_RETRIES - 1:
                 raise error
@@ -218,8 +219,7 @@ def _parse_completion(response: Any, model: str) -> Completion:
                 usage[key] = value
 
         # 缓存命中/未命中：DeepSeek 会把这两个单列出来。
-        # 命中部分单价低一个数量级，不记录就无法估算真实成本。
-        # 实测同一段长前缀连续请求，第二次命中率可达 90%。
+        # 保存服务返回的缓存计量；不推断缺失的命中率。
         for key in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
             value = getattr(usage_raw, key, None)
             if isinstance(value, int):

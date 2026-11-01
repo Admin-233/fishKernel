@@ -1,8 +1,4 @@
-"""常量与模型参数表。
-
-模型参数以 DeepSeek-V4.1-Flash（1017）为准，取自 api.deepseek.com/models:
-  context_window = 1048576, max_output_tokens = 393216, effort: low/high/max。
-"""
+"""运行上限与旧档默认模型参数；显式配置优先，模型名不构成白名单。"""
 
 from __future__ import annotations
 
@@ -15,7 +11,7 @@ DEFAULT_MAX_TOKENS = 8192
 DEFAULT_TURN_DELAY = 1.0
 DEFAULT_TEMPERATURE = 1.0
 
-# 压缩预算（与 dsh-compaction-basic 同一套算法）
+# 压缩预算：为输出和请求开销预留空间。
 COMPACT_THRESHOLD_RATIO = 0.6
 COMPACT_HEADROOM_TOKENS = 65_536
 COMPACT_RETAIN_RATIO = 0.16

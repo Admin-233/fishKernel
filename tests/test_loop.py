@@ -64,7 +64,7 @@ def test_stop_is_transient_and_does_not_block_startup(archive):
 def test_error_then_recovery(archive):
     kernel = make_kernel(
         archive,
-        [LLMError("模拟崩溃", retryable=False), Completion(text="我恢复了")],
+        [LLMError("模拟崩溃", retryable=True), Completion(text="我恢复了")],
         max_turns=2,
     )
     assert kernel.run() == 0
@@ -147,18 +147,7 @@ def test_no_delay_event_when_no_sleep(archive):
     assert delays == []
 
 
-# ---- 不可重试错误不该无限重试 -------------------------------------------------
-# 真实事故（2026-10-27 22:05）：我往 ToolsRegister.txt 追加了一行带路径的脏数据，
-# Archive.validate() 从此每次都抛 ArchiveError。内核每分钟重试一次，
-# 连续失败 40 次、卡了 10 分钟 —— 期间完全没有产出。
-#
-# 本质问题：`retryable=failures < 5` 只是**写进事件里的标记**，
-# 没有任何代码真的用它决定要不要继续。而「存档格式坏了」这类错误
-# 重试一万次也不会自愈，只会持续烧时间。
-
-
-# 用真实的不可恢复错误类型，而不是自造一个 —— 
-# 测试的价值在于验证「哪类异常会被判定为致命」，自造类型就测不到这个判断。
+# 使用真实存档错误验证失败分类，避免无意义的无限重试。
 from fishkernel.archive import ArchiveError as _FatalError
 
 
