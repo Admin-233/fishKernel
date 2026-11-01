@@ -1,3 +1,5 @@
+> 历史设计记录：保留最初设想。当前行为以 README、ARCHITECTURE 和 docs 为准。
+
 fishKernel
 
 

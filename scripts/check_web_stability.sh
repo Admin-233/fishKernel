@@ -6,7 +6,7 @@
 # 这两件事都只能靠长时间/高频访问才暴露，所以做成脚本定期跑。
 #
 # 用法：scripts/check_web_stability.sh [端口] [轮询次数]
-set -uo pipefail
+set -euo pipefail
 
 PORT="${1:-8787}"
 ROUNDS="${2:-300}"
@@ -53,19 +53,16 @@ else
   echo "  ✓ 无显著内存泄漏"
 fi
 
-# 响应时间不应随运行时长劣化。
-# 阈值参考实测基线：中位 6.3 ms、p95 8.5 ms（存储 4000+ 事件时）。
-# 原来写 100 ms —— 那要慢 15 倍才报警，等于没有断言。
-# 门槛设为「中位数 40 ms」，留约 6 倍余量给 CI 抖动，但能抓住真正的性能回归。
-BUDGET_MS=40
+# 可配置诊断预算；结果是样本平均值，不代表所有机器的统一性能承诺。
+BUDGET_MS="${FISHKERNEL_WEB_BUDGET_MS:-100}"
 T0=$(date +%s%N)
 SAMPLES=50
 for _ in $(seq 1 $SAMPLES); do curl -sf -o /dev/null "$URL"; done
 T1=$(date +%s%N)
-MEDIAN=$(( (T1 - T0) / (SAMPLES * 1000000) ))
-echo "  平均响应: ${MEDIAN} ms（预算 ${BUDGET_MS} ms，基线中位 6 ms）"
-if [[ "$MEDIAN" -gt "$BUDGET_MS" ]]; then
-  echo "  ⚠ 响应超出预算：${MEDIAN} ms > ${BUDGET_MS} ms（基线中位 6 ms）"
+MEAN=$(( (T1 - T0) / (SAMPLES * 1000000) ))
+echo "  平均响应: ${MEAN} ms（预算 ${BUDGET_MS} ms）"
+if [[ "$MEAN" -gt "$BUDGET_MS" ]]; then
+  echo "  ⚠ 响应超出预算：${MEAN} ms > ${BUDGET_MS} ms"
   FAIL=1
 fi
 

@@ -37,12 +37,14 @@ echo "— 控制 —"
 for action in pause resume; do
   curl -sf -X POST "http://127.0.0.1:$PORT/api/ctl" \
     -H 'Content-Type: application/json' -d "{\"action\":\"$action\"}" | \
-    python3 -c "import json,sys; print('$action ->', json.load(sys.stdin)['state']['run'])"
+    python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok']; assert d['state']['run'] == {'pause':'pause','resume':'run'}['$action']; print('$action ->',d['state']['run'])"
 done
 
 echo "— 错误处理 —"
-curl -s -o /dev/null -w 'POST 空消息     %{http_code}\n' -X POST "http://127.0.0.1:$PORT/api/say" \
-  -H 'Content-Type: application/json' -d '{"text":""}'
-curl -s -o /dev/null -w 'GET  未知路径   %{http_code}\n' "http://127.0.0.1:$PORT/nope"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/api/say" \
+  -H 'Content-Type: application/json' -d '{"text":""}')
+[[ "$code" == 400 ]] || { echo "空消息应返回 400，实际 $code" >&2; exit 1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/nope")
+[[ "$code" == 404 ]] || { echo "未知路径应返回 404，实际 $code" >&2; exit 1; }
 
 echo "冒烟通过。"

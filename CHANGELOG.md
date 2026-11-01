@@ -1,146 +1,16 @@
+# Changelog
+
+## v0.5.0（未发布）
+
+- 增加独立进程插件协议 v1、SDK、通用示例与统一管理接口。
+- 模型名不设白名单，支持声明式思考映射、能力配置和可选价格。
+- 模型生成期间保持输入接收与任务监督；中断工具等待，保留在途生成。
+- 修复持久输入确认、记忆水位、压缩提交恢复、事件半行和实例锁交接。
+- 修复历史工具结果配对，完整保存 reasoning；累计 usage 不受 trim 影响。
+- 增加旧 Agent 迁移基线，保留人格、记忆、摘要和事件；停用个人 hook 和旧工具加载。
+- TUI 按显示行滚动；Web 修复分页、重复轮询、令牌和发送失败保留输入。
+- Linux 为当前运行平台，增加 Linux 集成验证及 CI；整理文档和测试脚本。
+
 ## v0.4.4
 
-- 版本号改为单一来源（`__init__.py` 是真源，pyproject 用 setuptools dynamic attr）。
-  此前 CHANGELOG 已写到 v0.4.3，但两处都停在 0.3.0，`fishkernel --version` 一直报旧版本。
-  新增 `tests/test_version.py` 三项护栏：版本格式、pyproject 不得写死 version、
-  CHANGELOG 顶部版本必须等于包版本。
-- 新增 `tests/test_crash_recovery.py`（4 项）——把「崩了重启能接着跑」这条核心承诺
-  从人工试跑变成自动化测试。之前的单测只覆盖零件（`truncate_partial_tail`、
-  `recover_stale`、`TOOL_OUTCOME_UNKNOWN`），没有端到端验证：
-  - SIGKILL 之后重启，seq 必须接着涨而不是从 1 重来；
-  - 重启要记下第二次 `session/start`；
-  - 日志末尾半行要能被截断，且不产生 seq 缺口；
-  - 孤儿 `tool_call` 要被补上 `TOOL_OUTCOME_UNKNOWN`，否则 API 直接报错。
-  测试真的起子进程、真的 `kill -9`、真的重启——mock 掉进程就等于没测。
-  把 `EventLog.open()` 的 seq 基线改成 0，前三条立刻变红（`At index 121 diff: 1 != 122`）。
-
-- 204 -> 208 passed。
-
-## v0.4.3
-
-- **修复长期记忆在压缩时静默丢失**（数据丢失，严重）。`Compressor._flush_pending_memory()`
-  把一个压缩区间内的 `memory/write` 事件重放到 `LongTermMemory.txt`，原逻辑是：
-
-  ```python
-  if mode == "replace":
-      replace_text = content
-      appended = []          # 清空之前的 append
-  else:
-      appended.append(content)
-  ...
-  if replace_text is not None:
-      updated = replace_text + "\n"      # 只写 replace，appended 整个被丢弃
-  ```
-
-  `replace` **之后**的 `append` 会追加进 `appended`，但最终拼结果时走的是
-  `replace_text` 分支，`appended` 一个字都不会写出去——而函数照样返回
-  `len(pending)`，看上去「全部处理成功」。也就是说：**replace 之后的所有 append
-  被静默丢弃**。
-
-  这正是 Agent 自己的典型用法（先 `replace` 重写长期记忆，再 `append` 追加新事实），
-  一旦压缩触发就会真的丢记忆。而记忆只在压缩时才落盘，所以平时完全看不出来。
-
-  改为按事件顺序重放：`replace` 清空**此前**的内容（含早于它的 append），
-  但后续 append 照常生效；同时区分「本批含 replace」（不保留磁盘旧内容）与
-  「纯 append」（在磁盘旧内容后追加）。
-
-- 新增 6 项回归测试覆盖各种顺序：append→replace→append、纯 append、纯 replace、
-  多次 replace、空事件、全空白内容。已用「临时还原 bug」验证其中 3 项会失败。
-
-- 179 -> 185 passed。
-
-## v0.4.2
-
-用 ruff 扫 `F`（pyflakes）/ `B`（bugbear）两类规则时发现的问题，逐个核实后修复：
-
-- **`--snapshot` 只填满 8 行消息区**（真 bug，用户可见）。`_snapshot_frame()` 里
-  `chat = self._chat_lines(w, body_h)` 算完就丢掉了，真正传给 `render_frame` 的是
-  `self._chat_lines(w)` —— 少了 `height`，`_chat_lines` 退化成 `CHAT_ROWS or 8`。
-  `render_frame` 又按 `height - 4` 切片，于是 30 行的终端里 18 行是空白。
-  交互路径一直传的是 `body_h`，所以只有 `--snapshot` 暴露。
-  实测：消息区有内容的行数 8 → 25（height=30）。
-- **一个测不出任何东西的测试**。`test_left_pane_wraps_instead_of_truncating` 用
-  `row.split("│", 1)[0]` 取左栏，但 `│` 与标签前缀 `你│` 是同一个字符，
-  切出来的是标签本身；去掉标签后全是空串，被 `if not body: continue` 全部跳过，
-  三条断言等于没跑。改为从右侧 `rsplit` 切分，并补上注释里承诺、但从未写出的
-  「折行后拼回去必须等于原文」断言。
-- 同一测试里的 `left_w = max(20, int(100 * app.CHAT_SPLIT) - 1) if False else 41`：
-  `if False` 让左边成为死代码（且引用了当时还不存在的 `app`，F821），
-  只要有人把条件改成 `True` 就会 `NameError`。改为真正从 `CHAT_SPLIT` 推导。
-- 清理 9 处未使用的 import（`control.py`、`test_events.py`、`test_image.py`、
-  `test_tui.py`、`test_web.py`），修一处闭包循环变量捕获（B023）。
-
-新增测试 `test_snapshot_fills_message_area`；两处修复都用「临时还原 bug」验证过
-对应测试确实会失败（快照测试报「消息区有 18/26 行是空的」）。
-
-- 178 -> 179 passed；`ruff check --select F,B,E9` 全绿。
-
-## v0.4.1
-
-- 修复 `jobs.tick()` 的超时判定在非 +0800 机器上失效：
-
-  ```python
-  started = time.mktime(time.strptime(job.started_at, "%Y-%m-%dT%H:%M:%S%z"))
-  ```
-
-  `%z` 只让 `strptime` 认出偏移，`mktime` 却一律按**进程所在时区**解释那串 wall clock，
-  tzinfo 被静默丢掉。本机时区恰好是 +0800，所以测试全绿；换到 UTC 的服务器上，
-  每个任务的起始时刻都被算成 8 小时后 → 超时**永远不触发**（负偏移的机器上则会立刻误杀）。
-  改为 `datetime.strptime(..., %z).timestamp()`，保留 tzinfo；解析失败返回 `None`，
-  此时宁可让任务继续跑也不误杀。
-
-- 新增 4 项回归测试，全部在真实切换 `TZ` 下运行（`Asia/Shanghai` / `UTC` / `America/New_York`）：
-  同一时刻的不同写法必须解析成同一时间戳；刚启动的任务不得被判超时；真正过期的任务必须照杀。
-  已用「临时还原 bug」验证过这些测试确实会失败。
-
-- 174 -> 178 passed。
-
-## v0.4.0
-
-- 新增 `fishkernel web`：零依赖（stdlib `http.server`）网页控制台。事件流增量拉取、任务列表、暂停/继续/唤醒/交班重启/停止、发消息；与 TUI 同一套边界——只读事件日志、只写控制文件，不碰内核进程和锁。默认只监听 `127.0.0.1`，可用 `--host` / `--token` 开放。
-- 网页接口：`GET /api/snapshot`、`GET /api/job_output`、`POST /api/say`、`POST /api/ctl`，可直接用 curl 驱动。
-- 性能：20 万条事件（42 MB）下，冷启动快照 554 ms → 稳态轮询 9.8 ms。
-  - `UsageCache` 增量折叠 usage（`tokens.fold_usage_into`），不再每次重算全量；
-  - 增量取事件改用 `bisect` 二分定位，不再全表扫描。
-- 界面细节：事件流里超过 240 字的内容（工具结果、长命令）折叠成一行摘要，点开看全文；任务列表按 `started_at` 排序（`JobManager.list()` 是按 `proc-<hex>` 目录名排的，与时间无关）。
-- 新增 `tests/test_web.py`（30 项：投影、快照、真实 HTTP 往返、token 鉴权、usage 缓存一致性、任务排序）、`scripts/smoke_web.sh`、`docs/web.md`。
-- 144 -> 174 passed。
-
-# 更新日志
-
-## v0.3.0
-
-- 修复工具返回值超长时被切成非法 JSON：改为把超长字符串字段换成溢出指针，任何情况下都返回合法 JSON。
-- 修复超长末行导致重启后 seq 回退：`_last_seq` 改为反向分块扫描（最多 64 MB）。
-- `read_file` 超过 256 KiB 时把剩余内容写入 `Runtime/spill/`，不再只给一句提示。
-- 新增单实例锁 `Runtime/kernel.lock`（POSIX `flock` / Windows `msvcrt.locking`），第二个内核会报 `LockError`。
-- 新增交班重启：`ctl restart` / TUI `:restart`，旧进程启动新进程、释放锁后正常退出。
-- 新增唤醒：`ctl wake` / TUI `:wake`，可打断 `sleep` 与 `wait_job`。
-- 新增 `selfguard`：拒绝终止内核自身、父进程或同进程组的命令。
-- 修复真实用户消息被并进运行时通知；修复 `reasoning=None` 导致整轮丢失。
-- 新增 `delay` 事件、启动时清理 spill、`effort` 配置真正下发给 API。
-- 首次启动补欢迎语（`source=init`，只写一次）。
-- TUI：非终端环境改为持续跟随输出；放宽单类消息的行数上限；新增 `:wake` / `:restart`。
-
-## v0.2.0
-
-- 新增 `fishkernel tui`：实时事件流（上半屏）+ 输入框（下半屏），分类着色，长工具调用压缩显示。
-- 支持滚动回看、输入历史、`:pause/:resume/:stop/:delay` 命令；只读事件日志、只写控制文件。
-- 非交互模式：`--snapshot` 渲染一帧、`--plain` 按行输出；非终端环境自动退化。
-- 零新增依赖：POSIX 用 termios/select，Windows 用 msvcrt + VT。
-- 新增 `scripts/smoke_tui.sh`（快照 + 伪终端冒烟）。
-
-## v0.1.1
-
-- token 计量改为「API 实测锚点 + 增量估算 + 比例校准」：以响应的 `usage.prompt_tokens` 为准，只估算新增内容。
-- 修正中文 token 比例（官方：1 字符 ≈ 0.6 token）。
-- 事件中记录 `prompt_seq`、`prompt_tokens_actual`、`pressure_tokens`；`status` 显示累计用量。
-- 压缩支持分块摘要与合并，避免摘要请求自身超窗口。
-- 修复压缩后投影边界：保留尾部按 `to_seq` 取，不会再丢失。
-- 暂停改为 0.5 秒轮询，不再空转烧 CPU。
-
-## v0.1.0
-
-- 首个可用版本：事件日志、消息投影、工具调用、异步任务、上下文压缩、控制通道、崩溃恢复。
-- CLI：`new / run / ctl / say / status`。
-- 测试：67 项，含 mock 端到端。
+改造前的历史版本。旧版完整变更、设计演进及删除文件可从 Git 历史查阅。

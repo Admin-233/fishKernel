@@ -1,106 +1,26 @@
-# 测试与部署
-
-## 测试分层
-
-| 层 | 位置 | 是否联网 | 说明 |
-|---|---|---|---|
-| 单元 / 集成 | `tests/` | 否 | 事件、投影、压缩、任务、控制、工具、锁、TUI、mock 循环，共 111 项 |
-| 真实 API 冒烟 | `scripts/smoke_real.sh` | 是 | 限 2 轮，只读操作，验证 openai SDK + 工具调用 |
-| 工具链路冒烟 | `scripts/smoke_tools.sh` | 是 | 限 3 轮，验证 spawn → wait_job → job_output |
-| TUI 冒烟 | `scripts/smoke_tui.sh` | 否 | 渲染快照 + 在伪终端里启动一次真实 TUI |
-
-安全约定：由于内核给模型全部权限，**真实模型相关测试只在隔离测试机上跑**。纯单元测试不执行模型、不联网，可以在任意环境跑，但仍建议统一在测试机上执行，避免环境差异。
-
-## 本地跑单测
+# 测试
 
 ```bash
-python -m pytest -q
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
+python -m pytest
 ```
 
-只依赖 `pytest`。会用临时目录建存档，起几个 `echo` / `sleep` 子进程，不访问网络。
+完整验收必须在 Linux。测试包含真实文件锁、多进程、插件崩溃/超时、后台任务接管、
+SIGKILL 后恢复和真实 PTY；可移植单测不能替代这些验收。浏览器逻辑测试使用 Node.js
+执行页面中的实际脚本，验证令牌、单轮询链、分页和发送失败保留输入。
 
-## 推送到隔离测试机执行
+CI 使用 Linux / Python 3.10–3.13，并安装 Node.js。测试使用合成存档、脚本客户端和
+本机模拟 HTTP 服务，不需要真实模型密钥。端到端真实 API 冒烟为显式手动操作，
+设置 FISHKERNEL_API_KEY、FISHKERNEL_MODEL、FISHKERNEL_API_BASE 后再运行 smoke_real.sh。
 
-```bash
-export FISHKERNEL_TEST_HOST=<测试机地址>
-export FISHKERNEL_TEST_USER=<用户名>
-# 二选一：
-export FISHKERNEL_TEST_PASSWORD=<密码>     # SSH 密码 + sudo 密码
-# 或者配好 SSH key 且 sudo 免密（脚本会用 sudo -n）
+私有旧档验证：`python scripts/check_agent_archive.py /path/to/fish.tar.gz --resume`。
+仅从 tar 读取允许的数据文件，复制到临时目录；Linux 下 --resume 使用无网络客户端
+完成迁移、续跑、再次启动，校验原事件前缀及人格/记忆字节；不执行 tar 中程序。
+工具不输出记忆正文、密钥，不将私有样例提交仓库。
 
-python scripts/deploy.py
-```
-
-脚本做四件事：打包（排除 `.git`/`.venv`）→ `scp` → 远端解包 → 建 venv、装依赖、`pytest`。
-
-参数：
-
-```text
---host / --user / --password     同环境变量
---remote-dir                    默认 /home/<user>/fishKernel
---real-api                      追加真实 API 联调
---api-key                       默认读 FISHKERNEL_KEY
-```
-
-## 真实 API 联调
-
-```bash
-export FISHKERNEL_KEY=sk-...
-python scripts/deploy.py --real-api
-```
-
-`smoke_real.sh` 会：
-
-1. 在 `/tmp/fk-smoke` 新建存档；
-2. 在 `Agent.txt` 追加“只做只读操作、最多一次工具调用”的约束；
-3. 跑 2 轮，打印 `status`；
-4. 断言 `events.jsonl` 里出现 `assistant/message`，否则失败。
-
-工具链路联调（手动）：
-
-```bash
-ssh <test-host> 'FISHKERNEL_KEY=sk-... bash ~/fishKernel/scripts/smoke_tools.sh'
-```
-
-它会跑 3 轮：`spawn("echo fishkernel-ok")` → 内核通知任务完成 → `wait_job` → `job_output`，最后检查 `Runtime/jobs` 里出现 `fishkernel-ok`。
-
-## TUI 冒烟
-
-```bash
-bash scripts/smoke_tui.sh
-```
-
-先生成一份 mock 存档并跑 3 轮，再用 `--snapshot` 渲染一帧（肉眼检查布局），最后用 `script` 分配伪终端、真实启动 TUI 3 秒，确认能进入界面且不崩。
-
-## 交班冒烟
-
-```bash
-bash scripts/smoke_handover.sh
-```
-
-启动一个 mock 内核 → `ctl restart` 触发交班 → 检查 `events.jsonl` 里出现
-`session/handover → session/end(restart) → session/start(新 pid)`，并校验 seq 严格连续。
-
-## 加测试
-
-- 存档 fixture 在 `tests/conftest.py`，用 `tmp_path` 建临时存档。
-- 模型用 `ScriptedClient`（`fishkernel.llm`）：预置 `Completion` / 异常 / 函数，按顺序消费。
-- 循环测试把 `error_backoff_base=0`、`turn_delay=0`，否则会很慢。
-
-示例：
-
-```python
-def test_xxx(archive):
-    kernel = Kernel(archive.root, client=ScriptedClient([Completion(text="好")]), max_turns=1, echo=False, error_backoff_base=0)
-    kernel.run()
-```
-
-## 建议的 CI（未接入）
-
-```yaml
-# 概念示例
-- run: pip install -e '.[dev]'
-- run: python -m pytest -q
-```
-
-真实 API 的测试不要放进公开 CI，密钥会暴露在日志里；需要的话用受保护的 secret 并只跑 `--max-turns 1`。
+`scripts/check_memory_sync.py AGENT` 只读检查记忆基线；冲突非零退出。
+`scripts/check_coverage.sh` 使用当前 Python 环境的 coverage，测试失败不掩盖。
+`scripts/deploy.py` 仅打包 Git 已跟踪文件，通过用户现有 SSH 认证发送到独立测试目录，
+不保存密码、不执行 sudo。当前实施只提交本地 Git，部署脚本不会自行运行。

@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
-# 真实 API 端到端联调（限轮次）。用法：FISHKERNEL_KEY=sk-... bash scripts/smoke_real.sh
+# Explicit paid API smoke test; never used by offline CI.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
-: "${FISHKERNEL_KEY:?需要 FISHKERNEL_KEY 环境变量}"
-ARCHIVE=/tmp/fk-smoke
-rm -rf "$ARCHIVE"
-
-.venv/bin/fishkernel new "$ARCHIVE" --name 联调体 --api-key "$FISHKERNEL_KEY" --max-tokens 4096 --turn-delay 1
-
-# 联调只做只读操作，避免测试机上产生副作用
-printf '\n\n## 本轮附加约束\n这是一次限 2 轮的联调测试：只做只读操作（list_dir / read_file），最多调用一次工具；不要执行会修改系统的命令，也不要 sleep。\n' >> "$ARCHIVE/Memory/Agent.txt"
-
-echo "== 跑 2 轮 =="
-set +e
-timeout 240 .venv/bin/fishkernel run "$ARCHIVE" --max-turns 2 --quiet
-code=$?
-set -e
-echo "run exit=$code"
-
-echo "== 状态 =="
-.venv/bin/fishkernel status "$ARCHIVE" --tail 25
-
-if grep -q '"type":"assistant/message"' "$ARCHIVE/Runtime/events.jsonl"; then
-  echo "REAL_API_OK"
-else
-  echo "REAL_API_FAIL"
-  exit 1
-fi
+export FISHKERNEL_API_KEY="${FISHKERNEL_API_KEY:-${FISHKERNEL_KEY:-}}"
+: "${FISHKERNEL_API_KEY:?需要 FISHKERNEL_API_KEY}"
+: "${FISHKERNEL_MODEL:?需要 FISHKERNEL_MODEL}"
+: "${FISHKERNEL_API_BASE:?需要 FISHKERNEL_API_BASE}"
+PYTHON="${PYTHON:-python3}"
+TEMP_DIR="$(mktemp -d -t fishkernel-api-XXXXXX)"
+ARCHIVE="$TEMP_DIR/agent"
+echo "测试存档：$ARCHIVE"
+"$PYTHON" -m fishkernel new "$ARCHIVE" --name smoke --model "$FISHKERNEL_MODEL" --api-base "$FISHKERNEL_API_BASE" --max-tokens 2048 --turn-delay 0
+printf '\n仅回复 API 连接成功，不调用工具。\n' >> "$ARCHIVE/Memory/Agent.txt"
+timeout 180 "$PYTHON" -m fishkernel run "$ARCHIVE" --max-turns 1 --quiet
+"$PYTHON" - "$ARCHIVE" <<'PY'
+import sys
+from pathlib import Path
+from fishkernel.events import read_events
+events = read_events(Path(sys.argv[1]) / 'Runtime/events.jsonl')
+assert any(e.type == 'assistant/message' for e in events)
+assert not any(e.type == 'error' for e in events)
+assert events[-1].type == 'session/end' and events[-1].data['exit_code'] == 0
+print('REAL_API_OK')
+PY
